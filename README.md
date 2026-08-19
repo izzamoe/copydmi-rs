@@ -9,7 +9,23 @@ CLI Rust yang meng-otomatisasi proses "CopyDMI" ala komunitas badcaps.net (biasa
 ## Kenapa dibikin
 Attachment `CopyDMI.zip`/`CopyDMI.mps` di forum itu file macro proprietary buat software Windows (Tiny Hexer), sering ke-lock di balik requirement post-count/premium di forum. Tool ini reimplementasi logic yang sama (copy byte range tertentu dari file A ke file B) sebagai CLI portable, auditable, cross-platform — ga perlu Windows/Tiny Hexer.
 
-## Build
+## Install (gampang, tinggal 1 command)
+
+**Linux/macOS:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/izzamoe/copydmi-rs/master/install.sh | bash
+```
+
+**Windows (PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/izzamoe/copydmi-rs/master/install.ps1 | iex
+```
+
+Script ini otomatis: download binary terbaru dari [GitHub Releases](https://github.com/izzamoe/copydmi-rs/releases), verifikasi checksum SHA-256, install ke PATH user (`~/.local/bin` di Linux, `%LOCALAPPDATA%\Programs\copydmi` di Windows). Ga perlu install Rust/Cargo di komputer target.
+
+Setelah install, tinggal jalankan `copydmi --help` (buka terminal baru dulu kalau baru pertama install).
+
+## Build dari source
 Butuh Rust toolchain. Kalau ga ada di sistem lo, paling gampang pakai Docker:
 ```bash
 docker run --rm -v $(pwd):/app -w /app rust:latest cargo build --release
