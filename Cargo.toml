@@ -2,6 +2,12 @@
 name = "copydmi"
 version = "0.1.0"
 edition = "2021"
+description = "DMI/SMBIOS transplant + UEFI Firmware Volume checksum repair for Lenovo BIOS dumps"
+license = "MIT"
+repository = "https://github.com/izzamoe/copydmi-rs"
+authors = ["izzamoe"]
+keywords = ["bios", "uefi", "firmware", "lenovo", "dmi"]
+categories = ["command-line-utilities", "hardware-support"]
 
 [[bin]]
 name = "copydmi"

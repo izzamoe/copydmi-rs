@@ -81,6 +81,7 @@ struct FvInfo {
 #[derive(Debug, Clone)]
 struct FfsInfo {
     file_start: usize,   // offset of EFI_FFS_FILE_HEADER
+    #[allow(dead_code)] // kept for clarity/documentation of the classic FFS header layout
     header_len: usize,   // 24 (classic) — extended not supported
     data_start: usize,
     data_len: usize,

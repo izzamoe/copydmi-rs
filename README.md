@@ -1,5 +1,9 @@
 # copydmi (Rust) — DMI/SMBIOS Transplant Tool untuk BIOS Lenovo
 
+[![CI](https://github.com/izzamoe/copydmi-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/izzamoe/copydmi-rs/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
+
 CLI Rust yang meng-otomatisasi proses "CopyDMI" ala komunitas badcaps.net (biasanya dikerjakan manual pakai Tiny Hexer + macro `.mps`), khusus buat transplant blok DMI (serial number, model number, UUID) dari dump BIOS lama lo ke file BIOS baru yang bersih — sebelum di-flash ulang ke chip pakai CH341A.
 
 ## Kenapa dibikin
