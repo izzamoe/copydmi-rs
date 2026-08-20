@@ -4,24 +4,74 @@
 // but as a scriptable/auditable CLI instead of a black-box .mps macro file.
 //
 // DEFAULT OFFSETS are for the ADA-series (82C7 / E8CN) BIOS: DMI region 0x1000-0x2FFF
-// (per badcaps.net thread "IdeaPad 3 14ADA5/15ADA05/17ADA05 Lenovo V14-ADA/V15-ADA Bios").
+// RELATIVE TO THE REAL FIRMWARE IMAGE START (per badcaps.net thread "IdeaPad 3
+// 14ADA5/15ADA05/17ADA05 Lenovo V14-ADA/V15-ADA Bios"). See CLEAN-HEADER STRIPPING
+// below for why this matters and how it's handled automatically.
 // ALWAYS double check offsets against your own verified source before trusting blindly.
+//
+// CLEAN-HEADER STRIPPING (the "clean BIOS" step): the .cap firmware image extracted
+// from Lenovo's official installer for this chip family (e.g. e8cn39ww.exe) is NOT
+// the raw flash-ready image — it's wrapped in a 792-byte (0x318) header, and the real
+// firmware only starts after that. Verified byte-for-byte against TWO real BIOS
+// versions (e8cn39ww.exe AND e8cn41ww.exe — identical header offset in both):
+//   - Extracted BIOS.cap size: 8,950,768 bytes total
+//   - Bytes [0x000, 0x050): EFI_CAPSULE_HEADER (80 bytes: GUID, HeaderSize=0x50,
+//     Flags, CapsuleImageSize=8,950,768 i.e. the WHOLE wrapped file)
+//   - Bytes [0x050, 0x098): an outer Firmware Volume header (72 bytes, GUID
+//     78e58c8c-3d8a-1c4f-9935-8961-85c32dd3) whose declared FvLength spans nearly
+//     the entire file — this FV *wraps* the real firmware as a single big FFS file,
+//     it is not the real firmware layout itself.
+//   - Bytes [0x098, 0x318): FFS file header + signature/crypto blob (640 bytes)
+//   - Bytes [0x318, 0x800318): THE REAL FIRMWARE IMAGE — exactly 8,388,608 bytes
+//     (8 MiB / 0x800000), matching the Winbond W25Q64-class chip on this laptop
+//     family. Confirmed by: (a) every _FVH-validated Firmware Volume inside this
+//     slice lands on a round address (0x310000, 0x360000, 0x390000, 0x3A0000,
+//     0x730000) and the chain is perfectly contiguous, ending EXACTLY at 0x800000;
+//     (b) the SMBIOS/DMI vendor string "LENV\0" sits at RELATIVE offset 0x1000 and
+//     0x2000 inside this slice — i.e. right at the start and middle of the
+//     community-documented DMI range 0x1000-0x2FFF; (c) identical header offset in
+//     both e8cn39ww.exe and e8cn41ww.exe.
+//   - Bytes [0x800318, end): installer/debug metadata tail (562,152 bytes) — NOT
+//     firmware, safe to discard (PDB paths, printf-style debug format strings).
+// By default, copydmi now strips this 792-byte header from --old/--new BEFORE doing
+// the DMI transplant (which uses offsets relative to the real firmware, as per the
+// community guide), so --out is a ready-to-flash 8 MiB raw image, not a
+// capsule-wrapped blob. Override with --header-size/--chip-size or disable entirely
+// with --no-trim if your model's wrapper differs.
 //
 // USAGE:
 //   copydmi --old oldbios.bin --new newbios.bin --out patched.bin
 //   copydmi --old oldbios.bin --new newbios.bin --out patched.bin --start 0x1000 --end 0x2FFF
 //   copydmi --old oldbios.bin --new newbios.bin --out patched.bin --dry-run
+//   copydmi --old oldbios.bin --new newbios.exe --out patched.bin --chip-size 0x1000000
+//   copydmi --old oldbios.bin --new newbios.bin --out patched.bin --no-trim
 //
 // SAFETY:
 //   - Never overwrites newbios.bin/oldbios.bin in place; always writes to --out.
 //   - Refuses to run if --out already exists, unless --force is passed.
 //   - Verifies newbios.bin size before and after patch matches (BIOS image size must not change).
 //   - Prints a hex diff summary of the patched region before writing, unless --quiet.
+//   - Header-stripping removes bytes from the FRONT (the wrapper), then trims any
+//     remaining tail metadata down to --chip-size. Both steps are clearly logged
+//     with exact byte counts so the operation is fully auditable before you flash.
 
 use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
+
+/// Default header size to strip from the FRONT of the extracted .cap file before
+/// the DMI transplant: 792 bytes (0x318). This is the EFI_CAPSULE_HEADER (80B) +
+/// outer wrapping Firmware Volume header (72B) + FFS file header/signature blob
+/// (640B) that Lenovo's InnoSetup/InsydeFlash installer prepends ahead of the real
+/// flash-ready firmware image. See module doc comment above for full verification.
+const DEFAULT_HEADER_SIZE: usize = 0x318; // 792 bytes
+
+/// Default target flash chip capacity for the Lenovo ADA-series (82C7/E8CN)
+/// family: 8 MiB (W25Q64-class chip), measured AFTER stripping DEFAULT_HEADER_SIZE.
+/// See module doc comment above for the verification behind this number.
+/// Override with --chip-size for other models.
+const DEFAULT_CHIP_SIZE: usize = 0x0080_0000; // 8,388,608 bytes
 
 struct Args {
     old: PathBuf,
@@ -34,6 +84,8 @@ struct Args {
     quiet: bool,
     verify_uefi: bool,
     fix_uefi_checksums: bool,
+    chip_size: Option<usize>, // Some(size) = trim/pad to this size; None = --no-trim, leave as-is
+    header_size: usize, // bytes to strip from the FRONT before anything else (default 0x318)
 }
 
 // ============================================================================
@@ -350,8 +402,10 @@ REQUIRED:
     --out <FILE>     Output path for the patched result (never overwrites inputs)
 
 OPTIONS:
-    --start <HEX|DEC>   Start offset of DMI region (default: 0x1000, ADA-series/82C7 default)
-    --end <HEX|DEC>     End offset of DMI region, inclusive (default: 0x2FFF, ADA-series/82C7 default)
+    --start <HEX|DEC>   Start offset of DMI region, RELATIVE TO THE REAL FIRMWARE (i.e.
+                        after header-stripping) (default: 0x1000, ADA-series/82C7 default)
+    --end <HEX|DEC>     End offset of DMI region, inclusive, same relative basis
+                        (default: 0x2FFF, ADA-series/82C7 default)
     --force             Allow overwriting --out if it already exists
     --dry-run           Show what would happen, compute diff stats, but do not write --out
     --quiet             Suppress the hex diff preview
@@ -361,19 +415,50 @@ OPTIONS:
                         After patching, find any FFS file whose data region overlaps the
                         DMI range and recompute its FFS data checksum (only when the file's
                         FFS_ATTRIB_CHECKSUM bit requires one). Implies --verify-uefi.
+    --header-size <HEX|DEC>
+                        Bytes to strip from the FRONT of --old/--new before anything else —
+                        this is the "clean BIOS" step (default: 0x318 / 792 bytes, verified
+                        for ADA-series/82C7/E8CN — see NOTES). This is the capsule+wrapper
+                        header Lenovo's installer prepends; --start/--end and all UEFI
+                        scanning happen AFTER this strip, on the real firmware image.
+    --chip-size <HEX|DEC>
+                        Target flash chip size in bytes — --old/--new are trimmed to this
+                        length AFTER --header-size is stripped (default: 0x800000 / 8 MiB,
+                        verified for ADA-series/82C7/E8CN chip family — see NOTES). Only
+                        removes trailing installer/debug metadata, never touches firmware.
+                        Set this if your model's chip is a different size (e.g. 16 MiB
+                        chips: --chip-size 0x1000000).
+    --no-trim           Disable BOTH header-stripping and chip-size trimming; use
+                        --old/--new exactly as loaded/extracted. Use this if you already
+                        pre-processed the files yourself, or your model's wrapper differs
+                        from the verified ADA-series/82C7 layout.
     -h, --help          Show this help
 
-EXAMPLE (ADA-series / 82C7 default offsets):
+EXAMPLE (ADA-series / 82C7 defaults: strip 792-byte header, then 8 MiB chip):
     copydmi --old dump_corrupt.bin --new e8cn39ww_extracted.bin --out fixed_bios.bin
     copydmi --old dump_corrupt.bin --new e8cn39ww.exe --out fixed_bios.bin   (feed the installer .exe directly)
+    copydmi --old dump.bin --new bios.exe --out out.bin --header-size 0 --chip-size 0x1000000   (different model)
+    copydmi --old dump.bin --new bios.exe --out out.bin --no-trim   (skip header-strip/trim entirely)
 
 NOTES:
-    - Offsets 0x1000-0x2FFF are specific to Lenovo ADA-series (V14/V15-ADA, IdeaPad 3 xxADA05, E8CN BIOS family).
-      Other Lenovo models / other brands use DIFFERENT offsets (e.g. some threads report 0x520000-0x5207FF).
+    - Offsets 0x1000-0x2FFF are specific to Lenovo ADA-series (V14/V15-ADA, IdeaPad 3 xxADA05, E8CN BIOS family),
+      and are RELATIVE TO THE REAL FIRMWARE IMAGE (i.e. after the 792-byte header strip below), not the raw
+      extracted .cap file. Other Lenovo models / other brands use DIFFERENT offsets and header sizes
+      (e.g. some threads report DMI at 0x520000-0x5207FF with no such wrapper header at all).
       Verify your model's offset from the relevant badcaps.net / community thread before trusting the default.
     - This copies bytes [start, end] from --old into --new at the SAME offset range, then writes as --out.
-    - Both files must be at least (end+1) bytes long, and --new must be the same total size as a valid
-      full BIOS image for your chip (do not feed it a truncated dump).
+    - CLEAN-HEADER STRIPPING + CHIP-SIZE TRIMMING (both default ON for ADA-series/82C7/E8CN): the .cap
+      firmware image extracted from Lenovo's official installer (e.g. e8cn39ww.exe, 8,950,768 bytes) is
+      NOT flash-ready as-is. It's wrapped in a 792-byte header (EFI_CAPSULE_HEADER + outer FV header + FFS
+      wrapper), and the real firmware is exactly 8 MiB starting right after that header. Verified
+      byte-for-byte against two real BIOS versions (e8cn39ww.exe and e8cn41ww.exe, identical header offset
+      in both): every _FVH-validated Firmware Volume inside the post-strip 8 MiB slice lands on a round
+      address (0x310000, 0x360000, 0x390000, 0x3A0000, 0x730000) forming a perfectly contiguous chain that
+      ends EXACTLY at 0x800000, and the SMBIOS/DMI vendor string "LENV\\0" sits at relative offset 0x1000
+      and 0x2000 — exactly the start and middle of the community-documented DMI range. copydmi strips
+      --header-size (default 792 bytes) from the front, then trims to --chip-size (default 8 MiB) from
+      the back, BEFORE doing the DMI transplant — so --out is a ready-to-flash raw image out of the box.
+      Use --no-trim to skip both steps if they don't apply to your model.
 "#
     );
 }
@@ -389,6 +474,9 @@ fn parse_args() -> Result<Args, String> {
     let mut quiet = false;
     let mut verify_uefi = false;
     let mut fix_uefi_checksums = false;
+    let mut chip_size: Option<usize> = Some(DEFAULT_CHIP_SIZE);
+    let mut header_size: usize = DEFAULT_HEADER_SIZE;
+    let mut no_trim = false;
 
     let mut it = env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -410,8 +498,20 @@ fn parse_args() -> Result<Args, String> {
                 fix_uefi_checksums = true;
                 verify_uefi = true;
             }
+            "--header-size" => {
+                header_size = parse_num(&it.next().ok_or("--header-size needs a value")?)?
+            }
+            "--chip-size" => {
+                chip_size = Some(parse_num(&it.next().ok_or("--chip-size needs a value")?)?)
+            }
+            "--no-trim" => no_trim = true,
             other => return Err(format!("unknown argument: {other}")),
         }
+    }
+
+    if no_trim {
+        chip_size = None;
+        header_size = 0;
     }
 
     let old = old.ok_or("--old is required")?;
@@ -422,7 +522,30 @@ fn parse_args() -> Result<Args, String> {
         return Err(format!("--start (0x{start:X}) must be <= --end (0x{end:X})"));
     }
 
-    Ok(Args { old, new, out, start, end, force, dry_run, quiet, verify_uefi, fix_uefi_checksums })
+    if let Some(size) = chip_size {
+        if size <= end {
+            return Err(format!(
+                "--chip-size (0x{size:X}) must be greater than --end (0x{end:X}) — trimming to this \
+                 size would cut off part of the DMI region itself. Use a larger --chip-size, adjust \
+                 --start/--end, or pass --no-trim."
+            ));
+        }
+    }
+
+    Ok(Args {
+        old,
+        new,
+        out,
+        start,
+        end,
+        force,
+        dry_run,
+        quiet,
+        verify_uefi,
+        fix_uefi_checksums,
+        chip_size,
+        header_size,
+    })
 }
 
 fn hex_preview(label: &str, buf: &[u8], start: usize, len_show: usize) {
@@ -566,8 +689,66 @@ fn run() -> Result<(), String> {
         ));
     }
 
-    let old_buf = load_bios_buf(&args.old, "old")?;
-    let new_buf = load_bios_buf(&args.new, "new")?;
+    let mut old_buf = load_bios_buf(&args.old, "old")?;
+    let mut new_buf = load_bios_buf(&args.new, "new")?;
+
+    // STEP 1: Strip the wrapper header from the FRONT (the "clean BIOS" step).
+    // Lenovo's InnoSetup/InsydeFlash installer prepends a fixed-size header
+    // (EFI_CAPSULE_HEADER + outer FV header + FFS wrapper, verified 792 bytes
+    // for ADA-series/82C7/E8CN) ahead of the real flash-ready firmware image.
+    // Everything downstream (--start/--end DMI range, UEFI FV/FFS scanning,
+    // --chip-size trimming) operates on the buffer AFTER this strip.
+    if args.header_size > 0 {
+        for (label, buf) in [("old", &mut old_buf), ("new", &mut new_buf)] {
+            if buf.len() <= args.header_size {
+                return Err(format!(
+                    "--{label} is only {} bytes, too small to strip --header-size (0x{:X} / {} bytes) \
+                     from the front. Pass --no-trim or a smaller --header-size if this file doesn't \
+                     have this wrapper.",
+                    buf.len(),
+                    args.header_size,
+                    args.header_size
+                ));
+            }
+            println!(
+                "  (stripping --{label}: removing {} bytes of capsule/wrapper header from the front \
+                 — \"clean BIOS\" step)",
+                args.header_size
+            );
+            buf.drain(0..args.header_size);
+        }
+    }
+
+    // STEP 2: Trim tail metadata down to the actual flash chip size, if enabled
+    // (default: on, 8 MiB, measured AFTER the header strip above). Only ever
+    // truncates from the end — the DMI region and all firmware volumes live
+    // near the start of the (now header-stripped) image, well below any sane
+    // chip-size boundary, so this is safe as long as --chip-size (or the
+    // default) is >= the DMI --end offset, which we verify before touching
+    // anything (see parse_args).
+    if let Some(target_size) = args.chip_size {
+        for (label, buf) in [("old", &mut old_buf), ("new", &mut new_buf)] {
+            if buf.len() > target_size {
+                let removed = buf.len() - target_size;
+                println!(
+                    "  (trimming --{label}: {} -> {} bytes, removed {} bytes of tail metadata \
+                     past chip size 0x{:X})",
+                    buf.len(),
+                    target_size,
+                    removed,
+                    target_size
+                );
+                buf.truncate(target_size);
+            } else if buf.len() < target_size {
+                println!(
+                    "  (note: --{label} is {} bytes, smaller than --chip-size 0x{:X} — leaving as-is, \
+                     not padding)",
+                    buf.len(),
+                    target_size
+                );
+            }
+        }
+    }
 
     let region_len = args.end - args.start + 1;
 
