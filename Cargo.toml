@@ -1,6 +1,6 @@
 [package]
 name = "copydmi"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "DMI/SMBIOS transplant + UEFI Firmware Volume checksum repair for Lenovo BIOS dumps"
 license = "MIT"
