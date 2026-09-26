@@ -85,7 +85,8 @@ struct Args {
     verify_uefi: bool,
     fix_uefi_checksums: bool,
     chip_size: Option<usize>, // Some(size) = trim/pad to this size; None = --no-trim, leave as-is
-    header_size: usize, // bytes to strip from the FRONT before anything else (default 0x318)
+    header_size: usize, // bytes to strip from the FRONT of --new before anything else (default 0x318)
+    old_header_size: usize, // bytes to strip from the FRONT of --old (defaults to header_size unless overridden)
 }
 
 // ============================================================================
@@ -476,6 +477,7 @@ fn parse_args() -> Result<Args, String> {
     let mut fix_uefi_checksums = false;
     let mut chip_size: Option<usize> = Some(DEFAULT_CHIP_SIZE);
     let mut header_size: usize = DEFAULT_HEADER_SIZE;
+    let mut old_header_size: Option<usize> = None; // None = use header_size (same as --new)
     let mut no_trim = false;
 
     let mut it = env::args().skip(1);
@@ -501,6 +503,9 @@ fn parse_args() -> Result<Args, String> {
             "--header-size" => {
                 header_size = parse_num(&it.next().ok_or("--header-size needs a value")?)?
             }
+            "--old-header-size" => {
+                old_header_size = Some(parse_num(&it.next().ok_or("--old-header-size needs a value")?)?)
+            }
             "--chip-size" => {
                 chip_size = Some(parse_num(&it.next().ok_or("--chip-size needs a value")?)?)
             }
@@ -512,6 +517,7 @@ fn parse_args() -> Result<Args, String> {
     if no_trim {
         chip_size = None;
         header_size = 0;
+        old_header_size = Some(0);
     }
 
     let old = old.ok_or("--old is required")?;
@@ -545,6 +551,7 @@ fn parse_args() -> Result<Args, String> {
         fix_uefi_checksums,
         chip_size,
         header_size,
+        old_header_size: old_header_size.unwrap_or(header_size),
     })
 }
 
@@ -698,24 +705,31 @@ fn run() -> Result<(), String> {
     // for ADA-series/82C7/E8CN) ahead of the real flash-ready firmware image.
     // Everything downstream (--start/--end DMI range, UEFI FV/FFS scanning,
     // --chip-size trimming) operates on the buffer AFTER this strip.
-    if args.header_size > 0 {
-        for (label, buf) in [("old", &mut old_buf), ("new", &mut new_buf)] {
-            if buf.len() <= args.header_size {
+    if args.header_size > 0 || args.old_header_size > 0 {
+        for (label, buf, hsize) in [
+            ("old", &mut old_buf, args.old_header_size),
+            ("new", &mut new_buf, args.header_size),
+        ] {
+            if hsize == 0 {
+                println!("  (--{label}: header-size is 0, skipping front-strip for this file)");
+                continue;
+            }
+            if buf.len() <= hsize {
                 return Err(format!(
-                    "--{label} is only {} bytes, too small to strip --header-size (0x{:X} / {} bytes) \
-                     from the front. Pass --no-trim or a smaller --header-size if this file doesn't \
+                    "--{label} is only {} bytes, too small to strip its header-size (0x{:X} / {} bytes) \
+                     from the front. Pass --no-trim or a smaller header-size if this file doesn't \
                      have this wrapper.",
                     buf.len(),
-                    args.header_size,
-                    args.header_size
+                    hsize,
+                    hsize
                 ));
             }
             println!(
                 "  (stripping --{label}: removing {} bytes of capsule/wrapper header from the front \
                  — \"clean BIOS\" step)",
-                args.header_size
+                hsize
             );
-            buf.drain(0..args.header_size);
+            buf.drain(0..hsize);
         }
     }
 
