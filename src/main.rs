@@ -87,6 +87,194 @@ struct Args {
     chip_size: Option<usize>, // Some(size) = trim/pad to this size; None = --no-trim, leave as-is
     header_size: usize, // bytes to strip from the FRONT of --new before anything else (default 0x318)
     old_header_size: usize, // bytes to strip from the FRONT of --old (defaults to header_size unless overridden)
+    show_dmi: bool, // decrypt + human-print the LENV/DMI blocks (Lenovo XOR scheme) instead of raw hex
+}
+
+// ============================================================================
+// Lenovo LENV/DMI block decoder (XOR scheme, reverse-engineered by the
+// community — see https://github.com/Shmurkio/LenovoDMIDecryptor).
+// ============================================================================
+// Layout (fixed offsets, relative to the real/header-stripped firmware image):
+//   LENV Block 1 @ 0x1000, size 0x1000
+//   LENV Block 2 @ 0x2000, size 0x1000
+// Header (16 bytes, NOT encrypted):
+//   +0x00 Signature[4]   "LENV"
+//   +0x04 Generation(u32) higher = newer, 0 = invalid
+//   +0x08 Entries(u32)    total entry count
+//   +0x0C AccessFlag(u8)  bit0 = write-protected
+//   +0x0D XorKey(u8)      every body byte (everything after the header) is XORed with this
+//   +0x0E Checksum(u16)   additive 16-bit checksum of the ENCRYPTED body
+// Entry (after XOR-decrypting the body):
+//   +0x00 NamespaceId[14]
+//   +0x0E Type(u16)
+//   +0x10 DataSize(u32)
+//   +0x14 Flags(u8), Unknown1(u8), Unknown2(u16)
+//   +0x18 Data[DataSize]
+#[derive(Debug, Clone)]
+struct LenvEntry {
+    namespace_id: [u8; 14],
+    entry_type: u16,
+    data: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct LenvBlock {
+    generation: u32,
+    xor_key: u8,
+    checksum: u16,
+    entries: Vec<LenvEntry>,
+}
+
+/// Parse one 0x1000-byte LENV block at `offset` in `buf`. Returns None if the
+/// signature doesn't match (e.g. this model's DMI isn't at this offset, or
+/// the block is genuinely blank/uninitialized).
+fn parse_lenv_block(buf: &[u8], offset: usize) -> Option<LenvBlock> {
+    const BLOCK_SIZE: usize = 0x1000;
+    if offset + BLOCK_SIZE > buf.len() {
+        return None;
+    }
+    let block = &buf[offset..offset + BLOCK_SIZE];
+    if &block[0..4] != b"LENV" {
+        return None;
+    }
+    let generation = u32::from_le_bytes(block[4..8].try_into().unwrap());
+    let entry_count = u32::from_le_bytes(block[8..12].try_into().unwrap());
+    let xor_key = block[13];
+    let checksum = u16::from_le_bytes(block[14..16].try_into().unwrap());
+
+    let mut body: Vec<u8> = block[16..].iter().map(|b| b ^ xor_key).collect();
+    // Sanity: entry_count must be plausible, or this isn't a real LENV block.
+    if entry_count > 256 {
+        return Some(LenvBlock { generation, xor_key, checksum, entries: Vec::new() });
+    }
+
+    let mut entries = Vec::new();
+    let mut pos = 0usize;
+    for _ in 0..entry_count {
+        if pos + 24 > body.len() {
+            break;
+        }
+        let mut namespace_id = [0u8; 14];
+        namespace_id.copy_from_slice(&body[pos..pos + 14]);
+        let entry_type = u16::from_le_bytes(body[pos + 14..pos + 16].try_into().unwrap());
+        let data_size = u32::from_le_bytes(body[pos + 16..pos + 20].try_into().unwrap()) as usize;
+        if data_size == 0 || pos + 24 + data_size > body.len() {
+            break;
+        }
+        let data = body[pos + 24..pos + 24 + data_size].to_vec();
+        entries.push(LenvEntry { namespace_id, entry_type, data });
+        pos += 24 + data_size;
+    }
+    Some(LenvBlock { generation, xor_key, checksum, entries })
+}
+
+/// Best-effort human label for known entry types (reverse-engineered from
+/// observed 82C7/E8CN dumps — NOT an exhaustive/official Lenovo spec).
+fn lenv_type_label(t: u16) -> &'static str {
+    match t {
+        0x0000 => "Product Name",
+        0x0005 => "Flags/Config (raw)",
+        0x000b => "Serial Number (secondary/OEM slot)",
+        0x0100 => "Board/BIOS ID",
+        0x0200 => "Machine Type Model (MTM)",
+        0x0400 => "Serial Number",
+        0x0500 => "UUID (raw 16 bytes, byte order unverified)",
+        0x0700 => "Region/Flag (single char)",
+        0x0b00 => "Family",
+        0x1000 => "Digital Product Key (DPK)",
+        _ => "(unlabeled/unknown)",
+    }
+}
+
+fn format_lenv_data(t: u16, data: &[u8]) -> String {
+    if t == 0x0500 {
+        return format!("{} (hex, {} bytes)", data.iter().map(|b| format!("{b:02X}")).collect::<String>(), data.len());
+    }
+    // Printable ASCII heuristic
+    if !data.is_empty() && data.iter().all(|&b| (0x20..0x7f).contains(&b) || b == 0) {
+        let s: String = data.iter().take_while(|&&b| b != 0).map(|&b| b as char).collect();
+        if !s.is_empty() {
+            return format!("{s:?}");
+        }
+    }
+    format!("{} (hex, {} bytes)", data.iter().map(|b| format!("{b:02X}")).collect::<String>(), data.len())
+}
+
+fn print_lenv_block(label: &str, offset: usize, block: &Option<LenvBlock>) {
+    match block {
+        None => println!("  [{label} @0x{offset:04X}] not a LENV block (no 'LENV' signature, or DMI isn't at this offset for this model)"),
+        Some(b) => {
+            println!(
+                "  [{label} @0x{offset:04X}] generation={} xor_key=0x{:02X} checksum=0x{:04X} entries={}",
+                b.generation, b.xor_key, b.checksum, b.entries.len()
+            );
+            for e in &b.entries {
+                println!(
+                    "      type=0x{:04X} [{:<38}] = {}",
+                    e.entry_type,
+                    lenv_type_label(e.entry_type),
+                    format_lenv_data(e.entry_type, &e.data)
+                );
+            }
+        }
+    }
+}
+
+/// Show + compare decrypted DMI (LENV) blocks for old/new/patched, so the
+/// operator sees human-readable Serial/MTM/Product/UUID values (not just raw
+/// hex bytes) and an explicit PASS/FAIL on whether the transplant carried the
+/// real values through unchanged.
+fn dmi_report(old_buf: &[u8], new_buf: &[u8], patched: Option<&[u8]>) {
+    println!("=== DMI (LENV) decode — Lenovo XOR scheme ===");
+    let old_b1 = parse_lenv_block(old_buf, 0x1000);
+    let old_b2 = parse_lenv_block(old_buf, 0x2000);
+    println!("-- old bios --");
+    print_lenv_block("old", 0x1000, &old_b1);
+    print_lenv_block("old", 0x2000, &old_b2);
+
+    println!("-- new bios (pre-patch) --");
+    let new_b1 = parse_lenv_block(new_buf, 0x1000);
+    let new_b2 = parse_lenv_block(new_buf, 0x2000);
+    print_lenv_block("new", 0x1000, &new_b1);
+    print_lenv_block("new", 0x2000, &new_b2);
+
+    if let Some(p) = patched {
+        println!("-- patched output --");
+        let p_b1 = parse_lenv_block(p, 0x1000);
+        let p_b2 = parse_lenv_block(p, 0x2000);
+        print_lenv_block("patched", 0x1000, &p_b1);
+        print_lenv_block("patched", 0x2000, &p_b2);
+
+        // Verdict: for each block, do the patched entries match old's entries
+        // byte-for-byte (same data), which is what "the transplant carried
+        // the real DMI through unchanged" means.
+        let matches = |a: &Option<LenvBlock>, b: &Option<LenvBlock>| -> bool {
+            match (a, b) {
+                (Some(x), Some(y)) => {
+                    x.entries.len() == y.entries.len()
+                        && x.entries.iter().zip(y.entries.iter()).all(|(ea, eb)| {
+                            ea.entry_type == eb.entry_type && ea.data == eb.data
+                        })
+                }
+                (None, None) => true,
+                _ => false,
+            }
+        };
+        let ok1 = matches(&old_b1, &p_b1);
+        let ok2 = matches(&old_b2, &p_b2);
+        println!("-- verdict --");
+        println!(
+            "  block @0x1000: {}",
+            if ok1 { "MATCH — patched output carries the real old-bios DMI values unchanged" } else { "MISMATCH — patched output DOES NOT match old-bios DMI, do not flash" }
+        );
+        println!(
+            "  block @0x2000: {}",
+            if ok2 { "MATCH — patched output carries the real old-bios DMI values unchanged" } else { "MISMATCH — patched output DOES NOT match old-bios DMI, do not flash" }
+        );
+        if !ok1 || !ok2 {
+            println!("  ################ WARNING: DMI VERIFICATION FAILED — DO NOT FLASH THIS OUTPUT ################");
+        }
+    }
 }
 
 // ============================================================================
@@ -479,6 +667,7 @@ fn parse_args() -> Result<Args, String> {
     let mut header_size: usize = DEFAULT_HEADER_SIZE;
     let mut old_header_size: Option<usize> = None; // None = use header_size (same as --new)
     let mut no_trim = false;
+    let mut show_dmi = false;
 
     let mut it = env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -510,6 +699,7 @@ fn parse_args() -> Result<Args, String> {
                 chip_size = Some(parse_num(&it.next().ok_or("--chip-size needs a value")?)?)
             }
             "--no-trim" => no_trim = true,
+            "--show-dmi" => show_dmi = true,
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -552,6 +742,7 @@ fn parse_args() -> Result<Args, String> {
         chip_size,
         header_size,
         old_header_size: old_header_size.unwrap_or(header_size),
+        show_dmi,
     })
 }
 
@@ -821,6 +1012,10 @@ fn run() -> Result<(), String> {
         uefi_report("new bios (pre-patch)", &new_buf);
     }
 
+    if args.show_dmi {
+        dmi_report(&old_buf, &new_buf, None);
+    }
+
     if args.dry_run {
         println!("  (dry-run) no output written.");
         return Ok(());
@@ -859,6 +1054,10 @@ fn run() -> Result<(), String> {
 
     if args.verify_uefi {
         uefi_report("patched output", &patched);
+    }
+
+    if args.show_dmi {
+        dmi_report(&old_buf, &new_buf, Some(&patched));
     }
 
     println!("  wrote patched bios: {} ({} bytes)", args.out.display(), patched.len());
