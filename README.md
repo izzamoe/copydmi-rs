@@ -80,8 +80,14 @@ Hasil akhir `--out` itu file **8MB persis, siap ditulis langsung ke chip** — b
 ```
 --start <HEX|DEC>       Start offset DMI, RELATIF ke firmware setelah header-strip (default 0x1000)
 --end <HEX|DEC>         End offset DMI, inclusive (default 0x2FFF)
---header-size <HEX|DEC> Bytes yang di-strip dari DEPAN sebelum apapun — step "clean BIOS"
+--header-size <HEX|DEC> Bytes yang di-strip dari DEPAN --new sebelum apapun — step "clean BIOS"
                         (default 0x318 / 792 bytes, khusus ADA-series/82C7/E8CN)
+--old-header-size <N>   Bytes yang di-strip dari DEPAN --old (default: sama dengan --header-size).
+                        Pakai ini kalau --old dan --new punya wrapper BEDA — contoh paling umum:
+                        --old itu dump chip mentah yang SUDAH bersih (mulai langsung dari "LDBG",
+                        tanpa capsule wrapper) sedangkan --new masih installer .exe yang perlu
+                        di-strip 792 byte. Tanpa flag ini, --old ikut ke-strip lagi dan DMI offset-nya
+                        geser jadi salah (hasil garbage, bukan error yang kelihatan).
 --chip-size <HEX|DEC>   Ukuran target chip, trim dari BELAKANG setelah header-strip
                         (default 0x800000 / 8MB, khusus ADA-series/82C7/E8CN)
 --no-trim               Matikan strip header + trim chip-size sepenuhnya (pakai file apa adanya)
@@ -90,6 +96,11 @@ Hasil akhir `--out` itu file **8MB persis, siap ditulis langsung ke chip** — b
 --quiet                 Skip preview hex
 --verify-uefi           Scan FV/FFS, laporkan validitas checksum (real parsing, bukan tebakan)
 --fix-uefi-checksums    Setelah patch, perbaiki checksum FFS yang overlap DMI (implies --verify-uefi)
+--show-dmi              Decode & tampilkan isi blok DMI (LENV) --old/--new/hasil patch secara
+                        manusiawi (Serial Number, Machine Type, UUID, dll) — dan kalau dipakai
+                        bareng transplant sungguhan (bukan --dry-run), kasih verdict eksplisit
+                        MATCH/MISMATCH per blok dibanding --old. Ini cara TERCEPAT buat verifikasi
+                        transplant berhasil, tanpa perlu script decode manual/tool eksternal.
 ```
 
 **Model lain / offset beda**: override manual, contoh:
@@ -102,10 +113,69 @@ Hasil akhir `--out` itu file **8MB persis, siap ditulis langsung ke chip** — b
 2. Download BIOS resmi dari Lenovo (`e8cn39ww.exe` / `e8cn41ww.exe`) — **ga perlu extract manual**, tinggal pakai langsung
 3. Jalankan copydmi, kasih EXE-nya langsung sebagai `--new`:
    ```bash
-   ./copydmi --old dump_asli.bin --new e8cn39ww.exe --out bios_final.bin --fix-uefi-checksums
+   ./copydmi --old dump_asli.bin --new e8cn39ww.exe --out bios_final.bin --fix-uefi-checksums --show-dmi
    ```
-4. Cek output log — pastikan "bytes differing" masuk akal (ga 0, ga 100%), size `--out` = 8,388,608 bytes
-5. Flash `bios_final.bin` ke chip pakai NeoProgrammer/flashrom via CH341A — file ini **sudah siap tulis langsung**, ga perlu proses tambahan di HxD.
+   Kalau `dump_asli.bin` itu dump chip mentah yang **sudah bersih** (langsung mulai dari `LDBG`, bukan hasil extract installer), tambahkan `--old-header-size 0` — kalau tidak, DMI-nya ikut ke-strip salah offset dan hasil transplant jadi garbage tanpa error yang kelihatan.
+4. Cek output log — pastikan "bytes differing" masuk akal (ga 0, ga 100%), size `--out` = 8,388,608 bytes, dan verdict `--show-dmi` bilang **MATCH** untuk kedua blok (0x1000 dan 0x2000). Kalau MISMATCH, tool bakal print warning `#### DO NOT FLASH ####` — jangan lanjut ke tahap flash kalau ini muncul.
+5. Flash `bios_final.bin` ke chip pakai `flashrom` via CH341A — lihat section di bawah untuk tutorial lengkap. File ini **sudah siap tulis langsung**, ga perlu proses tambahan di HxD.
+
+## Tutorial flash ke hardware (CH341A + flashrom di Linux)
+
+Diverifikasi end-to-end di kasus nyata (Lenovo V15-ADA 82C7A00RVN, S/N PC1VSPVC) — chip Winbond W25Q64.W 8MB, hasil `flashrom -w` + readback independen match SHA-256.
+
+**1. Install flashrom**
+Cek dulu apakah ada di repo resmi distro lo (Arch/CachyOS: `pacman -Si flashrom`) sebelum pakai AUR — biasanya udah tersedia di repo utama, ga perlu `yay`.
+```bash
+sudo pacman -S flashrom   # Arch/CachyOS, atau apt/dnf sesuai distro
+```
+
+**2. Sambungkan CH341A, pastikan terdeteksi OS**
+```bash
+lsusb | grep -i "1a86:5512"
+```
+Harus muncul baris `QinHeng Electronics CH341 in EPP/MEM/I2C mode`.
+
+**3. Lepas chip BIOS dari motherboard**, clip pakai SOIC-8 test clip ke CH341A (jangan solder langsung kalau bisa clip; chip harus benar-benar lepas dari board, bukan in-circuit, supaya ga ada tegangan bentrok).
+
+**4. Deteksi chip (WAJIB sebelum operasi apapun)**
+```bash
+sudo flashrom -p ch341a_spi
+```
+Kalau muncul "No EEPROM/flash device found" — klip belum nempel pas, coba ulang/perbaiki posisi klip. Kalau berhasil, muncul nama chip + ukurannya (contoh: `Found Winbond flash chip "W25Q64.W" (8192 kB, SPI)`) — cocokkan ukuran ini dengan ukuran `--out` (8,388,608 bytes = 8192 kB).
+
+**5. Backup isi chip sekarang — SELALU, tanpa kecuali, walau chip-nya sudah bermasalah**
+```bash
+sudo flashrom -p ch341a_spi -r backup_chip_asli_$(date +%Y%m%d).bin
+```
+Verifikasi **reliabilitas bacaan** sebelum lanjut — dump 2-3x lagi tanpa gerakin klip, cocokkan SHA-256-nya:
+```bash
+sudo flashrom -p ch341a_spi -r read2.bin
+sha256sum backup_chip_asli_*.bin read2.bin
+```
+Kalau hash beda antar dump → klip belum stabil, JANGAN lanjut ke write, benerin dulu kontaknya. Kalau hash sama semua → bacaan reliable, lanjut.
+
+**6. Verifikasi checksum file yang mau di-flash** sebelum ditulis (pastikan transfer/copy file ga korup):
+```bash
+sha256sum bios_final.bin   # cocokkan dengan checksum yang kamu catat pas generate filenya
+```
+
+**7. Write (flashrom otomatis read-before-write + verify di akhir)**
+```bash
+sudo flashrom -p ch341a_spi -w bios_final.bin
+```
+Tunggu sampai selesai tanpa gerakin klip (bisa beberapa menit — proses ini erase+write+verify seluruh 8MB). Output akhir harus `Verifying flash... VERIFIED.` — kalau ada error di tengah, JANGAN cabut klip, retry write lagi (chip belum tentu rusak, banyak kasus itu cuma retry biasa perlu diulang; backup langkah 5 jadi fallback kalau semua retry gagal).
+
+**8. Verifikasi independen tambahan** (jangan cuma percaya kata "VERIFIED" — baca ulang dan bandingkan manual):
+```bash
+sudo flashrom -p ch341a_spi -r verify_final.bin
+sha256sum verify_final.bin   # harus match persis checksum bios_final.bin
+```
+
+**9. Pasang chip balik** ke motherboard (perhatikan orientasi/pin 1), rakit ulang, nyalakan.
+
+**10. Setelah nyala**: masuk BIOS setup (F2 di kebanyakan Lenovo), pilih **Load Setup Defaults / Load Optimized Defaults** dulu sebelum boot ke OS — settingan CMOS lama biasanya ga sinkron sama firmware yang baru ditulis. Kalau S/N & Machine Type sudah benar di layar System Information, transplant DMI berhasil.
+
+**Kalau Windows lama sempat rusak/"Preparing automatic repair" gara-gara histori BIOS bermasalah** (DMI kosong/reset sebelum di-transplant): install ulang Windows bersih (custom install, hapus partisi lama) biasanya lebih cepat & pasti daripada nunggu auto-repair yang kemungkinan gagal terus. Kalau Windows dulu OEM-licensed, digital license biasanya otomatis balik aktif begitu online, karena hardware ID (S/N/UUID) sekarang sudah benar lagi.
 
 ## PENTING — Batasan tool ini
 - Cuma swap byte range DMI + (opsional) fix checksum FFS-level yang overlap range itu. TIDAK menangani extended FFS header, GUIDed/compressed section internals, Insyde vendor signing, atau secure-boot key.
