@@ -197,10 +197,24 @@ Tool ini mem-parsing struktur **UEFI Firmware Volume (FV)** dan **Firmware File 
 - Tool menemukan 5 real Firmware Volume di firmware bersih 8MB, semua header checksum OK, dan FV terakhir berhasil parse 158 FFS file di dalamnya (sebelum fix header-strip, parsing FV terakhir terpotong karena base offset salah).
 - Region DMI (`0x1000-0x2FFF` relatif) sekarang correctly overlap dengan data SMBIOS asli (`LENV` string terbaca di posisi yang tepat).
 
-## Source riset
-- https://www.badcaps.net/forum/troubleshooting-hardware-devices-and-electronics-theory/troubleshooting-laptops-tablets-and-mobile-devices/bios-requests-only/102197-copy-dmi-info-easily-with-hex-editing-software-and-macro-script (guide asli, Tiny Hexer + macro, offset 0x520000-0x5207FF contoh generic)
-- https://www.badcaps.net/forum/troubleshooting-hardware-devices-and-electronics-theory/troubleshooting-laptops-tablets-and-mobile-devices/bios-requests-only/85892-ideapad-3-14ada05-15ada05-17ada05-lenovo-v14-ada-v15-ada-bios (thread khusus ADA-series, sumber offset 0x1000-0x2FFF)
-- https://winraid.level1techs.com/t/problem-bad-lenovo-legion-5-pro-bios-flash/39904 (konfirmasi independen pola region LDBG/LENV* sebagai area DMI, BIOS Insyde sekeluarga)
-- https://github.com/LongSoft/InsydeImageExtractor/blob/master/extractor.c (referensi cara kerja extractor resmi Insyde image, meski model 82C7 pakai wrapper berbeda dari yang ditangani tool ini)
-- UEFI Platform Initialization (PI) Specification, Volume 3 (Firmware Volume / FFS structures) — dipakai sebagai basis implementasi parser, bukan forum post
-- Verifikasi mandiri: analisis byte-level terhadap `e8cn39ww.exe` dan `e8cn41ww.exe` asli (SHA-256 firmware bersih hasil strip: `28049cb8efd57c04a8f879f2bdc66bd43b4ceae2a8c5f231369f3baf80f19c02`)
+## Source riset / referensi implementasi
+
+### DMI / Lenovo LENV (dasar `--show-dmi`)
+- https://github.com/Shmurkio/LenovoDMIDecryptor — **referensi utama native decoder**. Repo ini mendokumentasikan storage proprietary Lenovo `LENV` di InsydeH2O, struktur entry, XOR decrypt/encrypt, dua blok redundan, serta relasi `LDBG` sebagai change log. Implementasi `--show-dmi` di tool ini dipasang dan diuji silang dari model tersebut; tidak menjalankan binary Windows dari repo tersebut.
+- https://winraid.level1techs.com/t/lenovo-dmi-decryption-tool/98137 — thread komunitas oleh penulis decryptor, konfirmasi konteks reverse engineering dan rujukan ke proyek `LenovoDMIDecryptor`.
+- https://www.badcaps.net/forum/troubleshooting-hardware-devices-and-electronics-theory/troubleshooting-laptops-tablets-and-mobile-devices/bios-requests-only/3286884-lenovo-dmi-decrypter — corroboration komunitas bahwa proyek tersebut menangani decrypt/extract/transfer DMI Lenovo.
+- https://www.badcaps.net/forum/troubleshooting-hardware-devices-and-electronics-theory/troubleshooting-laptops-tablets-and-mobile-devices/bios-requests-only/102197-copy-dmi-info-easily-with-hex-editing-software-and-macro-script — guide asli CopyDMI manual via Tiny Hexer + macro; offset `0x520000-0x5207FF` di sana adalah contoh generic, **bukan** default universal tool ini.
+- https://www.badcaps.net/forum/troubleshooting-hardware-devices-and-electronics-theory/troubleshooting-laptops-tablets-and-mobile-devices/bios-requests-only/85892-ideapad-3-14ada05-15ada05-17ada05-lenovo-v14-ada-v15-ada-bios — thread khusus ADA-series, sumber komunitas awal untuk region `0x1000-0x2FFF` pada keluarga ini.
+- https://winraid.level1techs.com/t/problem-bad-lenovo-legion-5-pro-bios-flash/39904 — konfirmasi independen pola region `LDBG`/`LENV*` pada BIOS Lenovo InsydeH2O sekeluarga.
+
+### Image/container format dan checksum UEFI
+- https://github.com/LongSoft/InsydeImageExtractor/blob/master/extractor.c — referensi cara kerja extractor image Insyde; model 82C7 tetap memakai wrapper berbeda yang divalidasi secara byte-level di bawah.
+- https://uefi.org/sites/default/files/resources/UEFI_PI_Spec_Final_Draft_1.9.pdf — UEFI Platform Initialization Specification; basis parser Firmware Volume/FFS dan validasi checksum. Bukan forum post.
+- Verifikasi mandiri: analisis byte-level terhadap installer Lenovo asli `e8cn39ww.exe` dan `e8cn41ww.exe`; untuk keluarga ini firmware bersih dimulai setelah wrapper `0x318`, panjang target `0x800000` (8 MiB). SHA-256 firmware bersih yang dicatat pada riset awal: `28049cb8efd57c04a8f879f2bdc66bd43b4ceae2a8c5f231369f3baf80f19c02`.
+
+### Flashing hardware (CH341A + flashrom)
+- https://flashrom.org/supported_hw/supported_prog/ch341ab.html — dokumentasi upstream programmer CH341A/B dan mode SPI/I2C yang diperlukan oleh `flashrom`.
+- https://flashrom.org/classic_cli_manpage.html — dokumentasi CLI upstream untuk `flashrom`, termasuk programmer `ch341a_spi`, read/write/verify.
+- https://winraid.level1techs.com/t/guide-how-to-use-a-ch341a-spi-programmer-flasher/33041 — panduan komunitas tambahan untuk penggunaan CH341A/SPI; prosedur README ini tetap menambahkan guard sendiri: backup berulang, hash antar-read harus sama, dan readback SHA-256 independen setelah write.
+
+> **Batasan sumber:** layout/offset tidak universal antar Lenovo. `--show-dmi` hanya mengklaim hasil decode jika signature `LENV` dan struktur entry-nya lulus sanity check; label field yang tidak diketahui tetap dicetak raw hex. Untuk model/family lain, cross-check dump dan source model-specific dulu sebelum flash.
