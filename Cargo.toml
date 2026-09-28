@@ -2,11 +2,11 @@
 name = "copydmi"
 version = "0.4.0"
 edition = "2021"
-description = "DMI/SMBIOS transplant + UEFI Firmware Volume checksum repair for Lenovo BIOS dumps"
+description = "Rust CLI for Lenovo BIOS DMI/SMBIOS transplant, LENV decode, clean-image preparation, and SPI flash verification"
 license = "MIT"
 repository = "https://github.com/izzamoe/copydmi-rs"
 authors = ["izzamoe"]
-keywords = ["bios", "uefi", "firmware", "lenovo", "dmi"]
+keywords = ["bios", "dmi", "lenovo", "insydeh2o", "flashrom"]
 categories = ["command-line-utilities", "hardware-support"]
 
 [[bin]]
