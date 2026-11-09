@@ -1,4 +1,4 @@
-# copydmi (Rust) — DMI/SMBIOS Transplant + Clean-BIOS Tool untuk Lenovo
+# copydmi
 
 [English](README.md) | **Bahasa Indonesia**
 
@@ -6,217 +6,155 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
 
-CLI Rust yang meng-otomatisasi proses "CopyDMI" ala komunitas badcaps.net (biasanya dikerjakan manual pakai Tiny Hexer + macro `.mps`), **plus** "clean BIOS" (strip capsule/wrapper header) — hasil akhirnya file `.bin` **siap flash langsung** ke chip pakai CH341A, bukan cuma capsule mentah.
+Mengembalikan serial number, UUID, dan model (DMI/SMBIOS) laptop Lenovo setelah chip BIOS terhapus atau diganti. `copydmi` mengambil dump chip asli plus BIOS resmi Lenovo, lalu menghasilkan image mentah siap flash pakai CH341A / `flashrom`.
 
-## Kenapa dibikin
-Attachment `CopyDMI.zip`/`CopyDMI.mps` di forum itu file macro proprietary buat software Windows (Tiny Hexer), sering ke-lock di balik requirement post-count/premium di forum. Tool ini reimplementasi logic yang sama (copy byte range tertentu dari file A ke file B) sebagai CLI portable, auditable, cross-platform — ga perlu Windows/Tiny Hexer, **dan** otomatis strip header capsule yang biasanya dikerjakan manual pakai HxD.
+> **Peringatan:** flash BIOS bisa membuat perangkat mati permanen. Simpan beberapa backup identik dari chip asli, cek hash SHA-256-nya, dan pastikan offset sesuai model Lenovo kamu sebelum menulis apa pun.
 
-## Install (gampang, tinggal 1 command)
+## Fungsi
 
-**Linux/macOS:**
-```bash
-curl -fsSL https://raw.githubusercontent.com/izzamoe/copydmi-rs/master/install.sh | bash
-```
+- Membaca installer `.exe` resmi Lenovo langsung (diekstrak di memori, tanpa 7-Zip atau Docker) atau file mentah `.bin` / `.cap` / `.fd` / `.rom`.
+- Membuang wrapper installer dan memotong ke ukuran chip fisik.
+- Menyalin region DMI dari dump lama ke firmware baru.
+- Men-decode blok DMI `LENV` Lenovo dan **menolak menulis** image yang tidak membawa DMI kamu dengan utuh.
+- Opsional: memperbaiki checksum FFS UEFI yang overlap dengan range DMI.
 
-**Windows (PowerShell):**
-```powershell
-irm https://raw.githubusercontent.com/izzamoe/copydmi-rs/master/install.ps1 | iex
-```
+**Dipakai untuk:** mesin Lenovo InsydeH2O dengan penyimpanan DMI `LENV`. Default tervalidasi untuk seri ADA (V14-ADA, V15-ADA, IdeaPad 3 14/15/17ADA05, keluarga BIOS E8CN).
+**Jangan dipakai asal untuk:** keluarga Lenovo lain atau merek lain. Offset dan ukuran wrapper beda, lihat [Model lain](#model-lain).
 
-Script ini otomatis: download binary terbaru dari [GitHub Releases](https://github.com/izzamoe/copydmi-rs/releases), verifikasi checksum SHA-256, install ke PATH user (`~/.local/bin` di Linux, `%LOCALAPPDATA%\Programs\copydmi` di Windows). Ga perlu install Rust/Cargo di komputer target.
+## Mulai cepat
 
-Setelah install, tinggal jalankan `copydmi --help` (buka terminal baru dulu kalau baru pertama install).
+1. Install ([detail](#install)):
 
-## Build dari source
-Butuh Rust toolchain. Kalau ga ada di sistem lo, paling gampang pakai Docker:
-```bash
-docker run --rm -v $(pwd):/app -w /app rust:latest cargo build --release
-```
-Atau kalau ada Rust lokal:
-```bash
-cargo build --release
-```
-Binary hasil ada di `target/release/copydmi` (juga sudah dicopy ke `./copydmi` di folder ini).
-
-## Pakai (cara paling simpel — semua otomatis)
-```bash
-./copydmi --old dump_asli_lo.bin --new e8cn39ww.exe --out bios_siap_flash.bin --fix-uefi-checksums
-```
-
-`--new` (dan `--old`) bisa langsung terima:
-- File `.exe` installer resmi Lenovo — otomatis diextract in-memory (pure Rust, crate `inno`, ga butuh innoextract/7z/Docker)
-- File raw dump (`.bin`/`.cap`/`.fd`/`.rom`)
-
-Untuk **model ADA-series (V15-ADA/82C7, E8CN family)**, tool ini otomatis (default ON, ga perlu flag tambahan):
-1. **Strip 792-byte capsule/wrapper header** dari depan file — ini step "clean BIOS" yang biasanya dikerjakan manual pakai HxD/hex editor
-2. **Trim ke ukuran chip fisik 8MB (8,388,608 bytes)** dari belakang — buang sisa metadata installer/debug string
-3. Transplant DMI (`0x1000-0x2FFF`, relatif ke firmware bersih setelah strip)
-4. (opsional `--fix-uefi-checksums`) repair checksum FFS yang overlap DMI
-
-Hasil akhir `--out` itu file **8MB persis, siap ditulis langsung ke chip** — bukan capsule + metadata installer.
-
-## Riset di balik "clean BIOS" step (jangan skip baca ini sebelum flash)
-
-**Masalah**: file `.cap`/`.fd` hasil extract installer Lenovo (`e8cn39ww.exe`, `e8cn41ww.exe`, dll) itu **8,950,768 bytes** — lebih besar dari chip fisik (Winbond W25Q64-class, 8MB = 8,388,608 bytes). Kalau langsung diflash apa adanya, hasilnya salah/corrupt.
-
-**Struktur yang sudah diverifikasi byte-per-byte** (terhadap 2 versi BIOS berbeda: e8cn39ww.exe DAN e8cn41ww.exe — hasil identik di keduanya):
-
-| Offset (raw file) | Panjang | Isi |
-|---|---|---|
-| `0x000` | 80 byte | `EFI_CAPSULE_HEADER` (GUID, HeaderSize=0x50, Flags, CapsuleImageSize) |
-| `0x050` | 72 byte | Outer Firmware Volume header (wrapper, membungkus seluruh isi sebagai 1 FFS file besar) |
-| `0x098` | 640 byte | FFS file header + signature/crypto blob |
-| **`0x318`** | **8,388,608 byte (8MB persis)** | **FIRMWARE IMAGE ASLI — ini yang harus di-flash** |
-| `0x800318` | 562,152 byte sisa | Debug strings, PDB path, metadata installer (buangan) |
-
-**Bukti yang mengonfirmasi (bukan tebakan):**
-1. Base offset `0x318` **identik** di 2 versi BIOS berbeda (e8cn39ww & e8cn41ww)
-2. Semua Firmware Volume valid (`_FVH` signature + header checksum OK) jatuh di alamat **bulat rapi** kalau dihitung relatif ke base `0x318`: `0x310000`, `0x360000`, `0x390000`, `0x3A0000`, `0x730000` — dan rantainya **kontigu sempurna, berakhir TEPAT di 0x800000** (8MB)
-3. String SMBIOS/DMI vendor `"LENV\0"` persis jatuh di **relative offset 0x1000** dan **0x2000** — pas di awal & tengah rentang DMI resmi komunitas (`0x1000-0x2FFF`)
-4. Forum winraid.level1techs.com soal Lenovo Legion 5 Pro (BIOS Insyde sekeluarga) mengonfirmasi pola region bernama `LDBG`/`LENV*` sebagai area DMI/machine-specific data
-
-**Bug yang ditemukan & sudah diperbaiki**: versi tool sebelumnya transplant DMI di offset `0x1000` dari **raw file** (area kosong `FF FF FF...`) — bukan `0x1000` relatif ke firmware bersih (yaitu raw offset `0x1318`, isinya `LENV`). Sekarang sudah benar: strip header dulu, baru transplant di offset relatif yang tepat.
-
-## Opsi CLI
-
-```
---start <HEX|DEC>       Start offset DMI, RELATIF ke firmware setelah header-strip (default 0x1000)
---end <HEX|DEC>         End offset DMI, inclusive (default 0x2FFF)
---header-size <HEX|DEC> Bytes yang di-strip dari DEPAN --new sebelum apapun — step "clean BIOS"
-                        (default 0x318 / 792 bytes, khusus ADA-series/82C7/E8CN)
---old-header-size <N>   Bytes yang di-strip dari DEPAN --old (default: sama dengan --header-size).
-                        Pakai ini kalau --old dan --new punya wrapper BEDA — contoh paling umum:
-                        --old itu dump chip mentah yang SUDAH bersih (mulai langsung dari "LDBG",
-                        tanpa capsule wrapper) sedangkan --new masih installer .exe yang perlu
-                        di-strip 792 byte. Tanpa flag ini, --old ikut ke-strip lagi dan DMI offset-nya
-                        geser jadi salah (hasil garbage, bukan error yang kelihatan).
---chip-size <HEX|DEC>   Ukuran target chip, trim dari BELAKANG setelah header-strip
-                        (default 0x800000 / 8MB, khusus ADA-series/82C7/E8CN)
---no-trim               Matikan strip header + trim chip-size sepenuhnya (pakai file apa adanya)
---force                 Timpa file --out kalau udah ada
---dry-run               Cek dulu tanpa nulis file (liat berapa byte yang beda, preview hex)
---quiet                 Skip preview hex
---verify-uefi           Scan FV/FFS, laporkan validitas checksum (real parsing, bukan tebakan)
---fix-uefi-checksums    Setelah patch, perbaiki checksum FFS yang overlap DMI (implies --verify-uefi)
---show-dmi              Decode & tampilkan isi blok DMI (LENV) --old/--new/hasil patch secara
-                        manusiawi (Serial Number, Machine Type, UUID, dll) — dan kalau dipakai
-                        bareng transplant sungguhan (bukan --dry-run), kasih verdict eksplisit
-                        MATCH/MISMATCH per blok dibanding --old. Ini cara TERCEPAT buat verifikasi
-                        transplant berhasil, tanpa perlu script decode manual/tool eksternal.
-```
-
-**Model lain / offset beda**: override manual, contoh:
-```bash
-./copydmi --old old.bin --new new.bin --out out.bin --header-size 0 --start 0x520000 --end 0x5207FF --no-trim
-```
-
-## Alur pemakaian lengkap (kasus Izzam - 82C7)
-1. Dump chip BIOS lo yang sekarang pakai CH341A (walau corrupt) → simpan sebagai `dump_asli.bin`
-2. Download BIOS resmi dari Lenovo (`e8cn39ww.exe` / `e8cn41ww.exe`) — **ga perlu extract manual**, tinggal pakai langsung
-3. Jalankan copydmi, kasih EXE-nya langsung sebagai `--new`:
    ```bash
-   ./copydmi --old dump_asli.bin --new e8cn39ww.exe --out bios_final.bin --fix-uefi-checksums --show-dmi
+   curl -fsSL https://raw.githubusercontent.com/izzamoe/copydmi-rs/master/install.sh | bash
    ```
-   Kalau `dump_asli.bin` itu dump chip mentah yang **sudah bersih** (langsung mulai dari `LDBG`, bukan hasil extract installer), tambahkan `--old-header-size 0` — kalau tidak, DMI-nya ikut ke-strip salah offset dan hasil transplant jadi garbage tanpa error yang kelihatan.
-4. Cek output log — pastikan "bytes differing" masuk akal (ga 0, ga 100%), size `--out` = 8,388,608 bytes, dan verdict `--show-dmi` bilang **MATCH** untuk kedua blok (0x1000 dan 0x2000). Sejak v0.4.1 cek LENV selalu aktif: tool exit code 1 dan TIDAK menulis output kalau `--old` tidak punya blok LENV valid, atau blok hasil patch beda dari `--old`. Blok tanpa data di `--old` dilaporkan `NO DATA`, bukan `MATCH`. `--skip-dmi-check` hanya untuk model non-LENV.
-5. Flash `bios_final.bin` ke chip pakai `flashrom` via CH341A — lihat section di bawah untuk tutorial lengkap. File ini **sudah siap tulis langsung**, ga perlu proses tambahan di HxD.
 
-## Tutorial flash ke hardware (CH341A + flashrom di Linux)
+2. Jalankan dengan dump asli dan installer resmi:
 
-Diverifikasi end-to-end di kasus nyata (Lenovo V15-ADA 82C7A00RVN, S/N PC1VSPVC) — chip Winbond W25Q64.W 8MB, hasil `flashrom -w` + readback independen match SHA-256.
+   ```bash
+   copydmi --old dump_chip_asli.bin --new e8cn41ww.exe --out bios_siap_flash.bin \
+     --fix-uefi-checksums --show-dmi
+   ```
 
-**1. Install flashrom**
-Cek dulu apakah ada di repo resmi distro lo (Arch/CachyOS: `pacman -Si flashrom`) sebelum pakai AUR — biasanya udah tersedia di repo utama, ga perlu `yay`.
-```bash
-sudo pacman -S flashrom   # Arch/CachyOS, atau apt/dnf sesuai distro
+   Kalau dump berupa baca chip mentah yang sudah diawali `LDBG`, tambahkan `--old-header-size 0` ([alasan](#skenario)).
+
+3. Cek hasil ([cara membaca](#membaca-hasil)). Yang diharapkan: `MATCH` di blok, exit code `0`, dan ukuran output persis seukuran chip (8.388.608 byte untuk seri ADA).
+
+4. Flash dan verifikasi: [docs/flashing.md](docs/flashing.md) (bahasa Inggris).
+
+Contoh output run yang berhasil (dump uji sintetis, bukan mesin asli):
+
+```text
+-- verdict --
+  block @0x1000: MATCH — patched output carries the real old-bios DMI values unchanged
+  block @0x2000: MATCH — patched output carries the real old-bios DMI values unchanged
+  wrote patched bios: bios_siap_flash.bin (8388608 bytes)
 ```
 
-**2. Sambungkan CH341A, pastikan terdeteksi OS**
-```bash
-lsusb | grep -i "1a86:5512"
-```
-Harus muncul baris `QinHeng Electronics CH341 in EPP/MEM/I2C mode`.
+Contoh run yang ditolak (dump lama tidak punya DMI sama sekali), exit code 1, tidak ada file ditulis:
 
-**3. Lepas chip BIOS dari motherboard**, clip pakai SOIC-8 test clip ke CH341A (jangan solder langsung kalau bisa clip; chip harus benar-benar lepas dari board, bukan in-circuit, supaya ga ada tegangan bentrok).
-
-**4. Deteksi chip (WAJIB sebelum operasi apapun)**
-```bash
-sudo flashrom -p ch341a_spi
-```
-Kalau muncul "No EEPROM/flash device found" — klip belum nempel pas, coba ulang/perbaiki posisi klip. Kalau berhasil, muncul nama chip + ukurannya (contoh: `Found Winbond flash chip "W25Q64.W" (8192 kB, SPI)`) — cocokkan ukuran ini dengan ukuran `--out` (8,388,608 bytes = 8192 kB).
-
-**5. Backup isi chip sekarang — SELALU, tanpa kecuali, walau chip-nya sudah bermasalah**
-```bash
-sudo flashrom -p ch341a_spi -r backup_chip_asli_$(date +%Y%m%d).bin
-```
-Verifikasi **reliabilitas bacaan** sebelum lanjut — dump 2-3x lagi tanpa gerakin klip, cocokkan SHA-256-nya:
-```bash
-sudo flashrom -p ch341a_spi -r read2.bin
-sha256sum backup_chip_asli_*.bin read2.bin
-```
-Kalau hash beda antar dump → klip belum stabil, JANGAN lanjut ke write, benerin dulu kontaknya. Kalau hash sama semua → bacaan reliable, lanjut.
-
-**6. Verifikasi checksum file yang mau di-flash** sebelum ditulis (pastikan transfer/copy file ga korup):
-```bash
-sha256sum bios_final.bin   # cocokkan dengan checksum yang kamu catat pas generate filenya
+```text
+error: old bios has no usable LENV DMI block at 0x1000 or 0x2000 (wrong dump, wrong --old-header-size, ...
 ```
 
-**7. Write (flashrom otomatis read-before-write + verify di akhir)**
+## Install
+
+| Platform | Perintah |
+|---|---|
+| Linux / macOS | `curl -fsSL https://raw.githubusercontent.com/izzamoe/copydmi-rs/master/install.sh \| bash` |
+| Windows (PowerShell) | `irm https://raw.githubusercontent.com/izzamoe/copydmi-rs/master/install.ps1 \| iex` |
+| Manual | Unduh dari [Releases](https://github.com/izzamoe/copydmi-rs/releases) dan cek `SHA256SUMS.txt` |
+| Dari source | `cargo build --release` (binary di `target/release/copydmi`) |
+
+Script mengunduh rilis terbaru, memverifikasi SHA-256, lalu memasang ke PATH user (`~/.local/bin` atau `%LOCALAPPDATA%\Programs\copydmi`). Rust tidak perlu ada di komputer target. Buka terminal baru, lalu jalankan `copydmi --help`.
+
+## Membaca hasil
+
+Per blok DMI (`0x1000` dan `0x2000`):
+
+| Verdict | Arti |
+|---|---|
+| `MATCH` | Blok lama dan hasil patch berisi entry identik. |
+| `MISMATCH` | Hasil patch kehilangan atau mengubah DMI kamu. Error, tidak ada yang ditulis. **Jangan flash.** |
+| `NO DATA` | Dump lama tidak punya data usable di blok ini, jadi tidak ada yang dibandingkan. Tidak pernah dihitung lulus. |
+
+| Exit code | Arti |
+|---|---|
+| `0` | Output ditulis, setiap blok lama yang usable terverifikasi. |
+| `1` | Ditolak atau gagal: tidak ada LENV usable di `--old`, verifikasi mismatch, output sudah ada tanpa `--force`, atau error ukuran/range. Untuk kegagalan DMI, file output tidak ditulis. |
+
+Cek LENV selalu aktif (sejak v0.4.1) dan tidak bergantung pada `--show-dmi`; flag itu hanya menampilkan field hasil decode (serial, machine type, UUID). Pakai `--skip-dmi-check` hanya untuk model yang tidak menyimpan DMI sebagai LENV.
+
+## Opsi
+
+| Opsi | Default | Fungsi |
+|---|---|---|
+| `--old <FILE>` | wajib | Dump asli berisi DMI kamu (`.bin` atau `.exe` Lenovo). |
+| `--new <FILE>` | wajib | Firmware resmi yang bersih (`.bin` atau `.exe` Lenovo). |
+| `--out <FILE>` | wajib | Path output. File input tidak pernah ditimpa. |
+| `--start <N>` / `--end <N>` | `0x1000` / `0x2FFF` | Range DMI inklusif, relatif ke image bersih. |
+| `--header-size <N>` | `0x318` | Byte yang dibuang dari depan `--new`. |
+| `--old-header-size <N>` | sama dengan `--header-size` | Byte yang dibuang dari depan `--old`. Pakai `0` untuk dump chip yang sudah bersih. |
+| `--chip-size <N>` | `0x800000` (8 MiB) | Dipotong ke ukuran ini setelah strip. |
+| `--no-trim` | off | Matikan strip header dan trim. |
+| `--show-dmi` | off | Tampilkan field LENV hasil decode dan verdict per blok. |
+| `--skip-dmi-check` | off | Matikan cek LENV fail-closed (hanya model non-LENV). |
+| `--verify-uefi` | off | Laporkan status checksum FV/FFS. |
+| `--fix-uefi-checksums` | off | Perbaiki checksum data FFS yang overlap range DMI (otomatis menyalakan `--verify-uefi`). |
+| `--dry-run` | off | Validasi dan preview tanpa menulis. |
+| `--quiet` | off | Sembunyikan preview hex. |
+| `--force` | off | Timpa `--out` yang sudah ada. |
+
+Angka boleh hex (`0x1000`) atau desimal.
+
+## Skenario
+
+**Seri ADA standar.** Default berlaku: buang `0x318` dari installer, potong ke 8 MiB, transplant `0x1000-0x2FFF`.
+
+**Dump lama sudah bersih.** Baca chip mentah diawali `LDBG` dan tidak punya wrapper installer, sedangkan firmware baru masih berupa installer. Jangan strip kedua sisi:
+
 ```bash
-sudo flashrom -p ch341a_spi -w bios_final.bin
+copydmi --old dump_chip_bersih.bin --new e8cn41ww.exe --out bios_siap_flash.bin \
+  --old-header-size 0 --show-dmi --fix-uefi-checksums
 ```
-Tunggu sampai selesai tanpa gerakin klip (bisa beberapa menit — proses ini erase+write+verify seluruh 8MB). Output akhir harus `Verifying flash... VERIFIED.` — kalau ada error di tengah, JANGAN cabut klip, retry write lagi (chip belum tentu rusak, banyak kasus itu cuma retry biasa perlu diulang; backup langkah 5 jadi fallback kalau semua retry gagal).
 
-**8. Verifikasi independen tambahan** (jangan cuma percaya kata "VERIFIED" — baca ulang dan bandingkan manual):
+Tanpa `--old-header-size 0`, dump lama ikut ter-strip dua kali, offset bergeser, dan byte yang disalin salah.
+
+### Model lain
+
+Offset dan wrapper **tidak universal**. Override hanya setelah memvalidasi keluarga model kamu:
+
 ```bash
-sudo flashrom -p ch341a_spi -r verify_final.bin
-sha256sum verify_final.bin   # harus match persis checksum bios_final.bin
+copydmi --old old.bin --new new.bin --out out.bin \
+  --header-size 0 --start 0x520000 --end 0x5207FF --no-trim
 ```
 
-**9. Pasang chip balik** ke motherboard (perhatikan orientasi/pin 1), rakit ulang, nyalakan.
+## Alur yang disarankan
 
-**10. Setelah nyala**: masuk BIOS setup (F2 di kebanyakan Lenovo), pilih **Load Setup Defaults / Load Optimized Defaults** dulu sebelum boot ke OS — settingan CMOS lama biasanya ga sinkron sama firmware yang baru ditulis. Kalau S/N & Machine Type sudah benar di layar System Information, transplant DMI berhasil.
+1. Baca chip fisik dengan CH341A dan simpan dump aslinya tanpa diubah.
+2. Baca minimal dua kali lagi tanpa menggeser klip. Semua hash SHA-256 harus sama.
+3. Unduh firmware resmi untuk keluarga mesin yang tepat.
+4. Buat output dengan `--show-dmi` (tambahkan `--old-header-size 0` kalau perlu).
+5. Pastikan `MATCH`, exit code `0`, dan ukuran output sesuai.
+6. Tulis dengan `flashrom`, baca ulang, lalu bandingkan SHA-256 dengan file output.
+7. Setelah dirakit, load BIOS setup defaults sebelum boot ke OS.
 
-**Kalau Windows lama sempat rusak/"Preparing automatic repair" gara-gara histori BIOS bermasalah** (DMI kosong/reset sebelum di-transplant): install ulang Windows bersih (custom install, hapus partisi lama) biasanya lebih cepat & pasti daripada nunggu auto-repair yang kemungkinan gagal terus. Kalau Windows dulu OEM-licensed, digital license biasanya otomatis balik aktif begitu online, karena hardware ID (S/N/UUID) sekarang sudah benar lagi.
+Prosedur hardware lengkap: [docs/flashing.md](docs/flashing.md) (bahasa Inggris).
 
-## PENTING — Batasan tool ini
-- Cuma swap byte range DMI + (opsional) fix checksum FFS-level yang overlap range itu. TIDAK menangani extended FFS header, GUIDed/compressed section internals, Insyde vendor signing, atau secure-boot key.
-- Default `--header-size`/`--chip-size`/`--start`/`--end` itu terverifikasi khusus untuk **ADA-series/82C7/E8CN family** (V14-ADA, V15-ADA, IdeaPad 3 14/15/17ADA05) — model Lenovo lain kemungkinan besar beda wrapper/offset. Selalu cross-check kalau model lo bukan seri ini.
-- Selalu simpan backup `dump_asli.bin` yang ORIGINAL (belum diapa-apain) terpisah, jangan overwrite.
+## Batasan dan keamanan
 
-## Fitur checksum UEFI (--verify-uefi / --fix-uefi-checksums)
+- Hanya menyalin satu range byte dan bisa memperbaiki checksum data tingkat FFS yang relevan. Tidak memvalidasi semua signature vendor, section GUIDed/terkompresi, kunci secure-boot, extended FFS header, atau mekanisme integritas Insyde.
+- Default offset, ukuran wrapper, dan ukuran chip hanya terverifikasi untuk seri ADA.
+- `--show-dmi` hanya men-decode blok yang signature `LENV` dan struktur entry-nya lolos sanity check; tipe entry tak dikenal ditampilkan sebagai hex mentah.
+- Jangan pernah menimpa satu-satunya backup chip asli.
 
-Tool ini mem-parsing struktur **UEFI Firmware Volume (FV)** dan **Firmware File System (FFS)** sesuai spec resmi (UEFI PI Volume 3) — bukan asumsi/tebakan:
+## Dokumentasi lain (bahasa Inggris)
 
-**Apa yang dicek:**
-1. **FV header checksum** — scan seluruh file cari signature `_FVH`, validasi checksum 16-bit header (harus jumlah semua word = 0 mod 0x10000). Dilaporkan OK/BAD per FV yang ditemukan.
-2. **FFS file checksum** (di dalam tiap FV) — untuk file dengan header klasik (24-byte, non-extended):
-   - Header checksum (`IntegrityCheck.Header`) — divalidasi selalu.
-   - Data checksum (`IntegrityCheck.File`) — **hanya berlaku kalau bit `FFS_ATTRIB_CHECKSUM` (0x40) di-set** pada file itu. Kalau ga di-set, byte itu memang FIXED di 0xAA sesuai spec (bukan checksum asli) — tool ga akan "fix" bagian ini, karena memang ga perlu.
-3. **`--fix-uefi-checksums`**: setelah patch DMI, cari FFS file mana yang *data region*-nya overlap dengan range DMI yang baru saja di-swap, lalu recompute `IntegrityCheck.File` byte-nya kalau file itu emang butuh (attrib checksum di-set).
+- [docs/flashing.md](docs/flashing.md): CH341A + flashrom di Linux, langkah demi langkah.
+- [docs/technical.md](docs/technical.md): layout image seri ADA, dukungan checksum UEFI, verifikasi LENV.
+- [docs/references.md](docs/references.md): sumber dan karya sebelumnya.
+- [Releases](https://github.com/izzamoe/copydmi-rs/releases): binary dan changelog.
 
-**Hasil test nyata** (pakai `e8cn39ww.exe` asli, setelah fix header-strip):
-- Tool menemukan 5 real Firmware Volume di firmware bersih 8MB, semua header checksum OK, dan FV terakhir berhasil parse 158 FFS file di dalamnya (sebelum fix header-strip, parsing FV terakhir terpotong karena base offset salah).
-- Region DMI (`0x1000-0x2FFF` relatif) sekarang correctly overlap dengan data SMBIOS asli (`LENV` string terbaca di posisi yang tepat).
+## Lisensi
 
-## Source riset / referensi implementasi
-
-### DMI / Lenovo LENV (dasar `--show-dmi`)
-- https://github.com/Shmurkio/LenovoDMIDecryptor — **referensi utama native decoder**. Repo ini mendokumentasikan storage proprietary Lenovo `LENV` di InsydeH2O, struktur entry, XOR decrypt/encrypt, dua blok redundan, serta relasi `LDBG` sebagai change log. Implementasi `--show-dmi` di tool ini dipasang dan diuji silang dari model tersebut; tidak menjalankan binary Windows dari repo tersebut.
-- https://winraid.level1techs.com/t/lenovo-dmi-decryption-tool/98137 — thread komunitas oleh penulis decryptor, konfirmasi konteks reverse engineering dan rujukan ke proyek `LenovoDMIDecryptor`.
-- https://www.badcaps.net/forum/troubleshooting-hardware-devices-and-electronics-theory/troubleshooting-laptops-tablets-and-mobile-devices/bios-requests-only/3286884-lenovo-dmi-decrypter — corroboration komunitas bahwa proyek tersebut menangani decrypt/extract/transfer DMI Lenovo.
-- https://www.badcaps.net/forum/troubleshooting-hardware-devices-and-electronics-theory/troubleshooting-laptops-tablets-and-mobile-devices/bios-requests-only/102197-copy-dmi-info-easily-with-hex-editing-software-and-macro-script — guide asli CopyDMI manual via Tiny Hexer + macro; offset `0x520000-0x5207FF` di sana adalah contoh generic, **bukan** default universal tool ini.
-- https://www.badcaps.net/forum/troubleshooting-hardware-devices-and-electronics-theory/troubleshooting-laptops-tablets-and-mobile-devices/bios-requests-only/85892-ideapad-3-14ada05-15ada05-17ada05-lenovo-v14-ada-v15-ada-bios — thread khusus ADA-series, sumber komunitas awal untuk region `0x1000-0x2FFF` pada keluarga ini.
-- https://winraid.level1techs.com/t/problem-bad-lenovo-legion-5-pro-bios-flash/39904 — konfirmasi independen pola region `LDBG`/`LENV*` pada BIOS Lenovo InsydeH2O sekeluarga.
-
-### Image/container format dan checksum UEFI
-- https://github.com/LongSoft/InsydeImageExtractor/blob/master/extractor.c — referensi cara kerja extractor image Insyde; model 82C7 tetap memakai wrapper berbeda yang divalidasi secara byte-level di bawah.
-- https://uefi.org/sites/default/files/resources/UEFI_PI_Spec_Final_Draft_1.9.pdf — UEFI Platform Initialization Specification; basis parser Firmware Volume/FFS dan validasi checksum. Bukan forum post.
-- Verifikasi mandiri: analisis byte-level terhadap installer Lenovo asli `e8cn39ww.exe` dan `e8cn41ww.exe`; untuk keluarga ini firmware bersih dimulai setelah wrapper `0x318`, panjang target `0x800000` (8 MiB). SHA-256 firmware bersih yang dicatat pada riset awal: `28049cb8efd57c04a8f879f2bdc66bd43b4ceae2a8c5f231369f3baf80f19c02`.
-
-### Flashing hardware (CH341A + flashrom)
-- https://flashrom.org/supported_hw/supported_prog/ch341ab.html — dokumentasi upstream programmer CH341A/B dan mode SPI/I2C yang diperlukan oleh `flashrom`.
-- https://flashrom.org/classic_cli_manpage.html — dokumentasi CLI upstream untuk `flashrom`, termasuk programmer `ch341a_spi`, read/write/verify.
-- https://winraid.level1techs.com/t/guide-how-to-use-a-ch341a-spi-programmer-flasher/33041 — panduan komunitas tambahan untuk penggunaan CH341A/SPI; prosedur README ini tetap menambahkan guard sendiri: backup berulang, hash antar-read harus sama, dan readback SHA-256 independen setelah write.
-
-> **Batasan sumber:** layout/offset tidak universal antar Lenovo. `--show-dmi` hanya mengklaim hasil decode jika signature `LENV` dan struktur entry-nya lulus sanity check; label field yang tidak diketahui tetap dicetak raw hex. Untuk model/family lain, cross-check dump dan source model-specific dulu sebelum flash.
+MIT. Lihat [LICENSE](LICENSE).
