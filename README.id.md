@@ -118,7 +118,7 @@ Hasil akhir `--out` itu file **8MB persis, siap ditulis langsung ke chip** — b
    ./copydmi --old dump_asli.bin --new e8cn39ww.exe --out bios_final.bin --fix-uefi-checksums --show-dmi
    ```
    Kalau `dump_asli.bin` itu dump chip mentah yang **sudah bersih** (langsung mulai dari `LDBG`, bukan hasil extract installer), tambahkan `--old-header-size 0` — kalau tidak, DMI-nya ikut ke-strip salah offset dan hasil transplant jadi garbage tanpa error yang kelihatan.
-4. Cek output log — pastikan "bytes differing" masuk akal (ga 0, ga 100%), size `--out` = 8,388,608 bytes, dan verdict `--show-dmi` bilang **MATCH** untuk kedua blok (0x1000 dan 0x2000). Kalau MISMATCH, tool bakal print warning `#### DO NOT FLASH ####` — jangan lanjut ke tahap flash kalau ini muncul.
+4. Cek output log — pastikan "bytes differing" masuk akal (ga 0, ga 100%), size `--out` = 8,388,608 bytes, dan verdict `--show-dmi` bilang **MATCH** untuk kedua blok (0x1000 dan 0x2000). Sejak v0.4.1 cek LENV selalu aktif: tool exit code 1 dan TIDAK menulis output kalau `--old` tidak punya blok LENV valid, atau blok hasil patch beda dari `--old`. Blok tanpa data di `--old` dilaporkan `NO DATA`, bukan `MATCH`. `--skip-dmi-check` hanya untuk model non-LENV.
 5. Flash `bios_final.bin` ke chip pakai `flashrom` via CH341A — lihat section di bawah untuk tutorial lengkap. File ini **sudah siap tulis langsung**, ga perlu proses tambahan di HxD.
 
 ## Tutorial flash ke hardware (CH341A + flashrom di Linux)

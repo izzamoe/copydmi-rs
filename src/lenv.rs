@@ -145,9 +145,10 @@ pub fn format_lenv_data(t: u16, data: &[u8]) -> String {
     hex_with_len(data)
 }
 
-/// True if both blocks decode to the same entries (same type + same data, in
-/// order), or if neither location holds a LENV block at all. This is what "the
-/// transplant carried the real DMI through unchanged" means.
+/// True only if both blocks exist and decode to the same entries (same type +
+/// same data, in order). Two ABSENT blocks do NOT match: "no DMI on either side"
+/// is not evidence that the real DMI was carried through, so it must never
+/// produce a passing verdict.
 pub fn blocks_match(a: &Option<LenvBlock>, b: &Option<LenvBlock>) -> bool {
     match (a, b) {
         (Some(x), Some(y)) => {
@@ -157,8 +158,83 @@ pub fn blocks_match(a: &Option<LenvBlock>, b: &Option<LenvBlock>) -> bool {
                     .zip(y.entries.iter())
                     .all(|(ea, eb)| ea.entry_type == eb.entry_type && ea.data == eb.data)
         }
-        (None, None) => true,
         _ => false,
+    }
+}
+
+/// Per-block outcome of comparing the patched image against the OLD dump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockStatus {
+    /// Old has a usable block and patched carries identical entries.
+    Match,
+    /// Old has a usable block but patched differs or lost it.
+    Mismatch,
+    /// Old has no usable block here (no signature, or zero decodable entries):
+    /// nothing to verify against.
+    Unusable,
+}
+
+pub fn block_status(old: &Option<LenvBlock>, patched: &Option<LenvBlock>) -> BlockStatus {
+    match old {
+        Some(o) if !o.entries.is_empty() => {
+            if blocks_match(old, patched) {
+                BlockStatus::Match
+            } else {
+                BlockStatus::Mismatch
+            }
+        }
+        _ => BlockStatus::Unusable,
+    }
+}
+
+fn old_blocks(old_buf: &[u8]) -> [Option<LenvBlock>; 2] {
+    [
+        parse_lenv_block(old_buf, LENV_BLOCK1_OFFSET),
+        parse_lenv_block(old_buf, LENV_BLOCK2_OFFSET),
+    ]
+}
+
+/// Fail-closed precondition: the OLD dump must hold at least one LENV block
+/// with decodable entries, otherwise there is no real DMI/serial to preserve
+/// and any "success" would be meaningless.
+pub fn require_old_dmi(old_buf: &[u8]) -> Result<(), String> {
+    let usable = old_blocks(old_buf)
+        .iter()
+        .any(|b| matches!(b, Some(x) if !x.entries.is_empty()));
+    if usable {
+        Ok(())
+    } else {
+        Err(format!(
+            "old bios has no usable LENV DMI block at 0x{LENV_BLOCK1_OFFSET:X} or 0x{LENV_BLOCK2_OFFSET:X} \
+             (wrong dump, wrong --old-header-size, corrupt/blank DMI, or different model). \
+             Refusing: nothing to verify the transplant against. Use --skip-dmi-check only for \
+             models that do not use LENV."
+        ))
+    }
+}
+
+/// Fail-closed postcondition: every usable OLD block must appear unchanged in
+/// the patched image.
+pub fn verify_patched_dmi(old_buf: &[u8], patched: &[u8]) -> Result<(), String> {
+    let old = old_blocks(old_buf);
+    let pat = [
+        parse_lenv_block(patched, LENV_BLOCK1_OFFSET),
+        parse_lenv_block(patched, LENV_BLOCK2_OFFSET),
+    ];
+    let offsets = [LENV_BLOCK1_OFFSET, LENV_BLOCK2_OFFSET];
+    let mut bad = Vec::new();
+    for i in 0..2 {
+        if block_status(&old[i], &pat[i]) == BlockStatus::Mismatch {
+            bad.push(format!("0x{:X}", offsets[i]));
+        }
+    }
+    if bad.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "DMI verification FAILED: LENV block(s) at {} in the patched output do not match the old dump. DO NOT FLASH. Output not written.",
+            bad.join(", ")
+        ))
     }
 }
 
@@ -182,13 +258,16 @@ fn print_lenv_block(label: &str, offset: usize, block: &Option<LenvBlock>) {
     }
 }
 
-fn print_verdict_line(offset: usize, ok: bool) {
+fn print_verdict_line(offset: usize, st: BlockStatus) {
     println!(
         "  block @0x{offset:04X}: {}",
-        if ok {
-            "MATCH — patched output carries the real old-bios DMI values unchanged"
-        } else {
-            "MISMATCH — patched output DOES NOT match old-bios DMI, do not flash"
+        match st {
+            BlockStatus::Match =>
+                "MATCH — patched output carries the real old-bios DMI values unchanged",
+            BlockStatus::Mismatch =>
+                "MISMATCH — patched output DOES NOT match old-bios DMI, do not flash",
+            BlockStatus::Unusable =>
+                "NO DATA — old bios has no usable LENV block here, nothing to verify",
         }
     );
 }
@@ -220,23 +299,24 @@ pub fn dmi_report(old_buf: &[u8], new_buf: &[u8], patched: Option<&[u8]>) {
 
         // Verdict: for each block, do the patched entries match old's entries
         // byte-for-byte (same data).
-        let ok1 = blocks_match(&old_b1, &p_b1);
-        let ok2 = blocks_match(&old_b2, &p_b2);
+        let s1 = block_status(&old_b1, &p_b1);
+        let s2 = block_status(&old_b2, &p_b2);
         println!("-- verdict --");
-        print_verdict_line(LENV_BLOCK1_OFFSET, ok1);
-        print_verdict_line(LENV_BLOCK2_OFFSET, ok2);
-        if !ok1 || !ok2 {
+        print_verdict_line(LENV_BLOCK1_OFFSET, s1);
+        print_verdict_line(LENV_BLOCK2_OFFSET, s2);
+        if s1 == BlockStatus::Mismatch || s2 == BlockStatus::Mismatch {
             println!("  ################ WARNING: DMI VERIFICATION FAILED — DO NOT FLASH THIS OUTPUT ################");
         }
     }
 }
 
+/// Shared fixtures for unit tests (also used by the pipeline tests in `app`).
 #[cfg(test)]
-mod tests {
+pub mod testutil {
     use super::*;
 
     /// Build an encrypted 0x1000-byte LENV block from (type, data) entries.
-    fn build_block(generation: u32, xor_key: u8, entries: &[(u16, &[u8])]) -> Vec<u8> {
+    pub fn build_block(generation: u32, xor_key: u8, entries: &[(u16, &[u8])]) -> Vec<u8> {
         let mut body = Vec::new();
         for (t, data) in entries {
             let mut ns = [0u8; 14];
@@ -261,6 +341,12 @@ mod tests {
         assert_eq!(block.len(), LENV_BLOCK_SIZE);
         block
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testutil::build_block;
+    use super::*;
 
     fn image_with_block(block: &[u8]) -> Vec<u8> {
         let mut img = vec![0xFFu8; 0x3000];
@@ -378,8 +464,74 @@ mod tests {
 
     #[test]
     fn blocks_match_handles_absent_blocks() {
-        assert!(blocks_match(&None, &None));
+        // Regression: two ABSENT blocks used to count as a match, so a transplant
+        // between dumps with no DMI at all was reported as "real DMI carried through".
+        assert!(!blocks_match(&None, &None));
         assert!(!blocks_match(&block_of(&[]), &None));
         assert!(!blocks_match(&None, &block_of(&[])));
+    }
+
+    #[test]
+    fn status_unusable_when_old_has_no_block_or_no_entries() {
+        let some = block_of(&[(0x0400, b"SN1")]);
+        assert_eq!(block_status(&None, &None), BlockStatus::Unusable);
+        assert_eq!(block_status(&None, &some), BlockStatus::Unusable);
+        assert_eq!(
+            block_status(&block_of(&[]), &block_of(&[])),
+            BlockStatus::Unusable
+        );
+    }
+
+    #[test]
+    fn status_match_and_mismatch_for_usable_old() {
+        let old = block_of(&[(0x0400, b"SN1")]);
+        assert_eq!(
+            block_status(&old, &block_of(&[(0x0400, b"SN1")])),
+            BlockStatus::Match
+        );
+        assert_eq!(
+            block_status(&old, &block_of(&[(0x0400, b"SN2")])),
+            BlockStatus::Mismatch
+        );
+        assert_eq!(block_status(&old, &None), BlockStatus::Mismatch);
+    }
+
+    #[test]
+    fn require_old_dmi_rejects_blank_and_garbage_dumps() {
+        assert!(require_old_dmi(&vec![0xFFu8; 0x3000]).is_err());
+        assert!(require_old_dmi(&vec![0u8; 0x3000]).is_err());
+        // LENV signature present but zero decodable entries -> still unusable.
+        let empty = build_block(1, 0x11, &[]);
+        assert!(require_old_dmi(&image_with_block(&empty)).is_err());
+        // Image too short to hold the blocks.
+        assert!(require_old_dmi(&vec![0u8; 0x100]).is_err());
+    }
+
+    #[test]
+    fn require_old_dmi_accepts_one_good_block() {
+        let b = build_block(2, 0x5A, &[(0x0400, b"PF343TLP\0")]);
+        assert!(require_old_dmi(&image_with_block(&b)).is_ok());
+    }
+
+    #[test]
+    fn verify_patched_passes_when_dmi_preserved() {
+        let b = build_block(2, 0x5A, &[(0x0400, b"PF343TLP\0")]);
+        let old = image_with_block(&b);
+        assert!(verify_patched_dmi(&old, &old.clone()).is_ok());
+    }
+
+    #[test]
+    fn verify_patched_fails_when_dmi_changed_or_lost() {
+        let good = build_block(2, 0x5A, &[(0x0400, b"PF343TLP\0")]);
+        let other = build_block(2, 0x5A, &[(0x0400, b"XXXXXXXX\0")]);
+        let old = image_with_block(&good);
+        let changed = image_with_block(&other);
+        let err = verify_patched_dmi(&old, &changed).unwrap_err();
+        assert!(
+            err.contains("0x1000") && err.contains("DO NOT FLASH"),
+            "{err}"
+        );
+        let blank = vec![0xFFu8; 0x3000];
+        assert!(verify_patched_dmi(&old, &blank).is_err());
     }
 }
