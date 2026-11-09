@@ -5,7 +5,7 @@ use std::fs;
 
 use crate::cli::Args;
 use crate::image::{self, Trim};
-use crate::lenv::dmi_report;
+use crate::lenv::{dmi_report, require_old_dmi, verify_patched_dmi};
 use crate::loader::load_bios_buf;
 use crate::transplant::{count_differing, hex_preview_line, transplant};
 use crate::uefi::{fix_overlapping_ffs_checksums, uefi_report};
@@ -143,6 +143,12 @@ pub fn run(args: &Args) -> Result<(), String> {
         dmi_report(&old_buf, &new_buf, None);
     }
 
+    // Fail closed: without a real LENV DMI block in the old dump there is nothing
+    // to preserve or verify, so a "successful" transplant would be meaningless.
+    if !args.skip_dmi_check {
+        require_old_dmi(&old_buf)?;
+    }
+
     if args.dry_run {
         println!("  (dry-run) no output written.");
         return Ok(());
@@ -170,6 +176,15 @@ pub fn run(args: &Args) -> Result<(), String> {
         }
     }
 
+    // Verify BEFORE writing: a patched image that lost/changed the old DMI is never
+    // written to disk (and the process exits non-zero via the Err).
+    if !args.skip_dmi_check {
+        if args.show_dmi {
+            dmi_report(&old_buf, &new_buf, Some(&patched));
+        }
+        verify_patched_dmi(&old_buf, &patched)?;
+    }
+
     fs::write(&args.out, &patched)
         .map_err(|e| format!("failed to write --out '{}': {e}", args.out.display()))?;
 
@@ -185,7 +200,7 @@ pub fn run(args: &Args) -> Result<(), String> {
         uefi_report("patched output", &patched);
     }
 
-    if args.show_dmi {
+    if args.show_dmi && args.skip_dmi_check {
         dmi_report(&old_buf, &new_buf, Some(&patched));
     }
 
@@ -277,6 +292,7 @@ mod tests {
                 "0x20",
                 "--chip-size",
                 "0x4000",
+                "--skip-dmi-check",
             ],
             &old,
             &new,
@@ -298,17 +314,27 @@ mod tests {
         fs::write(&old, vec![1u8; 0x4000]).unwrap();
         fs::write(&new, vec![2u8; 0x4000]).unwrap();
 
-        let a = args(&["--no-trim", "--dry-run"], &old, &new, &out);
+        let a = args(
+            &["--no-trim", "--dry-run", "--skip-dmi-check"],
+            &old,
+            &new,
+            &out,
+        );
         run(&a).unwrap();
         assert!(!out.exists());
 
         fs::write(&out, b"keep").unwrap();
-        let a = args(&["--no-trim"], &old, &new, &out);
+        let a = args(&["--no-trim", "--skip-dmi-check"], &old, &new, &out);
         let err = run(&a).unwrap_err();
         assert!(err.starts_with("output file '"), "{err}");
         assert_eq!(fs::read(&out).unwrap(), b"keep");
 
-        let a = args(&["--no-trim", "--force"], &old, &new, &out);
+        let a = args(
+            &["--no-trim", "--force", "--skip-dmi-check"],
+            &old,
+            &new,
+            &out,
+        );
         run(&a).unwrap();
         assert_eq!(fs::read(&out).unwrap().len(), 0x4000);
     }
@@ -319,11 +345,157 @@ mod tests {
         let (old, new, out) = (s.path("old.bin"), s.path("new.bin"), s.path("out.bin"));
         fs::write(&old, vec![0u8; 0x2FFF]).unwrap();
         fs::write(&new, vec![0u8; 0x4000]).unwrap();
-        let err = run(&args(&["--no-trim"], &old, &new, &out)).unwrap_err();
+        let err = run(&args(&["--no-trim", "--skip-dmi-check"], &old, &new, &out)).unwrap_err();
         assert_eq!(
             err,
             "old bios file is too small (12287 bytes) for DMI range ending at 0x2FFF"
         );
         assert!(!out.exists());
+    }
+
+    // ---- fail-closed DMI behaviour (regression tests for the (None, None) => MATCH bug) ----
+
+    use crate::lenv::testutil::build_block;
+
+    /// 0x4000-byte image: 0xFF fill, optional LENV blocks at 0x1000 / 0x2000.
+    fn image_with(b1: Option<&[u8]>, b2: Option<&[u8]>) -> Vec<u8> {
+        let mut img = vec![0xFFu8; 0x4000];
+        if let Some(b) = b1 {
+            img[0x1000..0x2000].copy_from_slice(b);
+        }
+        if let Some(b) = b2 {
+            img[0x2000..0x3000].copy_from_slice(b);
+        }
+        img
+    }
+
+    fn write_pair(s: &Scratch, old: &[u8], new: &[u8]) -> (PathBuf, PathBuf, PathBuf) {
+        let (o, n, out) = (s.path("old.bin"), s.path("new.bin"), s.path("out.bin"));
+        fs::write(&o, old).unwrap();
+        fs::write(&n, new).unwrap();
+        (o, n, out)
+    }
+
+    const SAFE: [&str; 3] = ["--no-trim", "--show-dmi", "--force"];
+
+    #[test]
+    fn refuses_when_old_dump_has_no_lenv_and_writes_nothing() {
+        // The exact scenario from the bug report: no LENV on either side.
+        let s = Scratch::new("no-lenv-both");
+        let blank = image_with(None, None);
+        let (o, n, out) = write_pair(&s, &blank, &blank);
+        let err = run(&args(&SAFE, &o, &n, &out)).unwrap_err();
+        assert!(err.contains("no usable LENV DMI block"), "{err}");
+        assert!(!out.exists(), "no output may be written");
+    }
+
+    #[test]
+    fn refuses_when_old_has_no_lenv_even_if_new_has_one() {
+        let s = Scratch::new("no-lenv-old");
+        let good = build_block(2, 0x5A, &[(0x0400, b"PF343TLP\0")]);
+        let (o, n, out) = write_pair(
+            &s,
+            &image_with(None, None),
+            &image_with(Some(&good), Some(&good)),
+        );
+        assert!(run(&args(&SAFE, &o, &n, &out)).is_err());
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn refuses_when_old_lenv_has_zero_entries() {
+        let s = Scratch::new("empty-lenv");
+        let empty = build_block(1, 0x11, &[]);
+        let (o, n, out) = write_pair(
+            &s,
+            &image_with(Some(&empty), Some(&empty)),
+            &image_with(None, None),
+        );
+        assert!(run(&args(&SAFE, &o, &n, &out)).is_err());
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn succeeds_and_preserves_old_dmi_in_output() {
+        let s = Scratch::new("happy");
+        let mine = build_block(
+            5,
+            0x5A,
+            &[(0x0400, b"PF343TLP\0"), (0x0200, b"82C600ERID\0")],
+        );
+        let stock = build_block(1, 0x33, &[(0x0400, b"STOCKSN\0")]);
+        let (o, n, out) = write_pair(
+            &s,
+            &image_with(Some(&mine), Some(&mine)),
+            &image_with(Some(&stock), Some(&stock)),
+        );
+        run(&args(&SAFE, &o, &n, &out)).unwrap();
+        let got = fs::read(&out).unwrap();
+        assert_eq!(&got[0x1000..0x2000], &mine[..]);
+        assert_eq!(&got[0x2000..0x3000], &mine[..]);
+        assert_eq!(got.len(), 0x4000);
+    }
+
+    #[test]
+    fn succeeds_with_only_one_usable_old_block() {
+        // A single healthy redundant block is enough; the blank one is NO DATA, not a failure.
+        let s = Scratch::new("one-block");
+        let mine = build_block(5, 0x5A, &[(0x0400, b"PF343TLP\0")]);
+        let (o, n, out) = write_pair(&s, &image_with(Some(&mine), None), &image_with(None, None));
+        run(&args(&SAFE, &o, &n, &out)).unwrap();
+        assert_eq!(&fs::read(&out).unwrap()[0x1000..0x2000], &mine[..]);
+    }
+
+    #[test]
+    fn dmi_verification_runs_without_show_dmi_flag() {
+        // Verification must not depend on the optional --show-dmi display flag.
+        let s = Scratch::new("no-flag");
+        let blank = image_with(None, None);
+        let (o, n, out) = write_pair(&s, &blank, &blank);
+        assert!(run(&args(&["--no-trim", "--force"], &o, &n, &out)).is_err());
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn range_not_covering_blocks_fails_postcheck_and_writes_nothing() {
+        // --start/--end that skip block 2 leave the NEW image's (different) block 2 in place:
+        // the patched output no longer carries old DMI -> must be rejected, not written.
+        let s = Scratch::new("partial-range");
+        let mine = build_block(5, 0x5A, &[(0x0400, b"PF343TLP\0")]);
+        let stock = build_block(1, 0x33, &[(0x0400, b"STOCKSN\0")]);
+        let (o, n, out) = write_pair(
+            &s,
+            &image_with(Some(&mine), Some(&mine)),
+            &image_with(Some(&stock), Some(&stock)),
+        );
+        let a = args(
+            &["--no-trim", "--start", "0x1000", "--end", "0x1FFF"],
+            &o,
+            &n,
+            &out,
+        );
+        let err = run(&a).unwrap_err();
+        assert!(
+            err.contains("0x2000") && err.contains("DO NOT FLASH"),
+            "{err}"
+        );
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn skip_dmi_check_allows_non_lenv_models() {
+        let s = Scratch::new("skip");
+        let blank = image_with(None, None);
+        let (o, n, out) = write_pair(&s, &blank, &blank);
+        run(&args(&["--no-trim", "--skip-dmi-check"], &o, &n, &out)).unwrap();
+        assert!(out.exists());
+    }
+
+    #[test]
+    fn dry_run_also_rejects_old_without_lenv() {
+        let s = Scratch::new("dry");
+        let blank = image_with(None, None);
+        let (o, n, out) = write_pair(&s, &blank, &blank);
+        assert!(run(&args(&["--no-trim", "--dry-run"], &o, &n, &out)).is_err());
     }
 }

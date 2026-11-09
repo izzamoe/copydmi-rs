@@ -35,6 +35,7 @@ pub struct Args {
     pub chip_size: Option<usize>, // Some(size) = trim/pad to this size; None = --no-trim, leave as-is
     pub header_size: usize, // bytes to strip from the FRONT of --new before anything else (default 0x318)
     pub old_header_size: usize, // bytes to strip from the FRONT of --old (defaults to header_size unless overridden)
+    pub skip_dmi_check: bool, // opt out of the fail-closed LENV verification (non-LENV models only)
     pub show_dmi: bool, // decrypt + human-print the LENV/DMI blocks (Lenovo XOR scheme) instead of raw hex
 }
 
@@ -108,6 +109,10 @@ OPTIONS:
     --show-dmi          Decrypt and print Lenovo LENV DMI fields in --old/--new and, after a
                         real transplant, verify the patched output against --old with explicit
                         MATCH/MISMATCH verdicts for both redundant DMI blocks.
+    --skip-dmi-check    Disable the DEFAULT fail-closed LENV check. By default copydmi refuses to
+                        run when --old has no usable LENV block, and refuses to write --out when
+                        the patched LENV blocks differ from --old (exit code 1). Only use this for
+                        models that do not store DMI as LENV; you then verify DMI yourself.
     -h, --help          Show this help
 
 EXAMPLE (ADA-series / 82C7 defaults: strip 792-byte header, then 8 MiB chip):
@@ -163,6 +168,7 @@ where
     let mut old_header_size: Option<usize> = None; // None = use header_size (same as --new)
     let mut no_trim = false;
     let mut show_dmi = false;
+    let mut skip_dmi_check = false;
 
     let mut it = argv.into_iter();
     while let Some(arg) = it.next() {
@@ -194,6 +200,7 @@ where
             }
             "--no-trim" => no_trim = true,
             "--show-dmi" => show_dmi = true,
+            "--skip-dmi-check" => skip_dmi_check = true,
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -224,6 +231,7 @@ where
         chip_size,
         header_size,
         old_header_size: old_header_size.unwrap_or(header_size),
+        skip_dmi_check,
         show_dmi,
     }))
 }
@@ -307,6 +315,7 @@ mod tests {
         assert_eq!(a.chip_size, Some(0x80_0000));
         assert!(!a.force && !a.dry_run && !a.quiet);
         assert!(!a.verify_uefi && !a.fix_uefi_checksums && !a.show_dmi);
+        assert!(!a.skip_dmi_check, "DMI check must be ON by default");
     }
 
     #[test]

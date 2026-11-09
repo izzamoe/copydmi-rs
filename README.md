@@ -123,6 +123,7 @@ A previous implementation wrote at `0x1000` of the unstripped file, which was an
 --fix-uefi-checksums    Repair applicable FFS data checksums overlapping the transplant range
 --show-dmi              Decode and print LENV blocks from old/new/patched buffers; after a real
                         transplant, print MATCH or MISMATCH for every redundant DMI block.
+--skip-dmi-check        Disable the default fail-closed LENV check (non-LENV models only).
 ```
 
 ### Different old/new wrappers
@@ -162,7 +163,7 @@ copydmi \
 2. Read the chip at least two more times without moving the clip; all SHA-256 hashes must match.
 3. Download official firmware for the exact machine family.
 4. Generate output with `--show-dmi` and, if needed, `--old-header-size 0`.
-5. Confirm the output size matches the physical chip and `--show-dmi` reports `MATCH` for both DMI blocks. A `MISMATCH` means **do not flash**.
+5. Confirm the output size matches the physical chip. Since v0.4.1 the LENV check is always on: copydmi exits with code 1 and writes nothing if `--old` has no usable LENV block, or if the patched LENV blocks differ from `--old`. Use `--show-dmi` to see the decoded values. A block with no data in `--old` is reported as `NO DATA` (never `MATCH`).
 6. Write with `flashrom` or another verified SPI programming tool.
 7. Read the chip back and compare its SHA-256 against the exact output file.
 8. After reassembly, load BIOS setup defaults before booting the OS.
